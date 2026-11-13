@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""ncm-lite TUI —— 网易云音乐无损流媒体终端播放器（柔光慢动画 + 实时声波版）。"""
+"""ncm-lite TUI —— 网易云音乐无损流媒体终端播放器（柔光慢动画 + 真FFT频谱/波形版）。"""
 from __future__ import annotations
 
 import array
 import asyncio
 import bisect
+import cmath
 import math
 import random
 import subprocess
@@ -42,9 +43,54 @@ FG_ROSE = "#e89eb8"
 FG_PEACH = "#f0b7a4"
 FG_CREAM = "#ebd3a7"
 
-PEAK_SR = 4000
-PEAK_HOP = 160  # 40ms/frame -> 25 FPS
+# ── 预计算音频参数（12kHz 单声道，40ms / 帧 = 25Hz，256 点 FFT -> 24 对数频段） ──
+PEAK_SR = 12000
+PEAK_HOP = 480  # 40ms/frame -> 25 FPS
 PEAK_FPS = PEAK_SR / PEAK_HOP  # 25.0
+FFT_N = 256
+NUM_BANDS = 24
+
+_FFT_WIN = tuple(0.5 * (1.0 - math.cos(2.0 * math.pi * k / (FFT_N - 1))) for k in range(FFT_N))
+_FFT_BITS = FFT_N.bit_length() - 1
+_FFT_REV = tuple(
+    int(f"{i:0{_FFT_BITS}b}"[::-1], 2) for i in range(FFT_N)
+)
+_FFT_TWIDDLES: list[tuple[int, int, tuple[complex, ...]]] = []
+_sz = 2
+while _sz <= FFT_N:
+    _half = _sz // 2
+    _step = -2j * math.pi / _sz
+    _FFT_TWIDDLES.append((_sz, _half, tuple(cmath.exp(_step * k) for k in range(_half))))
+    _sz *= 2
+
+_BAND_RANGES: list[tuple[int, int, float]] = []
+for _b in range(NUM_BANDS):
+    _f0 = 1.0 * (126.0 ** (_b / NUM_BANDS))
+    _f1 = 1.0 * (126.0 ** ((_b + 1) / NUM_BANDS))
+    _i0 = max(1, int(math.floor(_f0)))
+    _i1 = max(_i0 + 1, min(FFT_N // 2, int(math.ceil(_f1))))
+    # 高频轻微倾斜补偿，让人声与镲片和低频鼓点能量均衡
+    _tilt = 0.72 + 0.85 * (_b / (NUM_BANDS - 1))
+    _BAND_RANGES.append((_i0, _i1, _tilt))
+
+
+def _compute_fft_bands(samples: list[float]) -> tuple[float, ...]:
+    """256 点基-2 FFT 并映射为 24 个对数分频感知能量（0.0..1.0）。"""
+    a = [samples[_FFT_REV[i]] * _FFT_WIN[_FFT_REV[i]] for i in range(FFT_N)]
+    for size, half, wtab in _FFT_TWIDDLES:
+        for start in range(0, FFT_N, size):
+            for k in range(half):
+                t = wtab[k] * a[start + k + half]
+                u = a[start + k]
+                a[start + k] = u + t
+                a[start + k + half] = u - t
+    mags = [abs(a[k]) for k in range(FFT_N // 2)]
+    out: list[float] = []
+    inv_n = 4.0 / FFT_N
+    for i0, i1, tilt in _BAND_RANGES:
+        pk = max(mags[i0:i1]) * inv_n * tilt
+        out.append(min(1.0, math.log1p(pk * 5.2) / 2.25))
+    return tuple(out)
 
 
 def _clamp_u8(v: float) -> int:
@@ -112,16 +158,19 @@ def fmt_time(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-# ── 流式音频 Peak 预计算引擎 ─────────────────────────────────────────────────
+# ── 流式音频 Peak & FFT 频谱预计算引擎 ────────────────────────────────────────
 class PeakTimeline:
-    """线程安全的渐进式音频 Peak / 三频段时间轴（25Hz）。"""
+    """线程安全的渐进式音频波形 Peak + 24 频段 FFT 频谱时间轴（25Hz）。"""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.frames: list[tuple[float, float, float, float, float]] = []
+        # 每帧: (peak, rms, bands_24)
+        self.frames: list[tuple[float, float, tuple[float, ...]]] = []
         self.done: bool = False
 
-    def append_batch(self, batch: list[tuple[float, float, float, float, float]]) -> None:
+    def append_batch(
+        self, batch: list[tuple[float, float, tuple[float, ...]]]
+    ) -> None:
         if not batch:
             return
         with self._lock:
@@ -131,8 +180,8 @@ class PeakTimeline:
         with self._lock:
             self.done = True
 
-    def sample(self, sec: float) -> tuple[float, float, float, float, float] | None:
-        """线性插值读取指定秒数的 (peak, rms, bass, mid, high)。"""
+    def sample_spectrum(self, sec: float) -> tuple[float, float, list[float]] | None:
+        """线性插值读取指定秒数的 (peak, rms, 24频段能量列表)。"""
         if sec < 0:
             sec = 0.0
         idx_f = sec * PEAK_FPS
@@ -142,44 +191,37 @@ class PeakTimeline:
             n = len(self.frames)
             if n == 0 or idx0 >= n:
                 return None
-            f0 = self.frames[idx0]
+            p0, r0, b0 = self.frames[idx0]
             if idx0 + 1 >= n:
-                return f0
-            f1 = self.frames[idx0 + 1]
-        return (
-            f0[0] + (f1[0] - f0[0]) * frac,
-            f0[1] + (f1[1] - f0[1]) * frac,
-            f0[2] + (f1[2] - f0[2]) * frac,
-            f0[3] + (f1[3] - f0[3]) * frac,
-            f0[4] + (f1[4] - f0[4]) * frac,
-        )
+                return p0, r0, list(b0)
+            p1, r1, b1 = self.frames[idx0 + 1]
+        bands = [b0[k] + (b1[k] - b0[k]) * frac for k in range(NUM_BANDS)]
+        return p0 + (p1 - p0) * frac, r0 + (r1 - r0) * frac, bands
 
-    def sample_window(
-        self, center_sec: float, span_sec: float, count: int
-    ) -> list[float] | None:
-        """读取 [center_sec - span_sec, center_sec] 区间内 count 个均匀峰谷点。"""
+    def sample_waveform(
+        self, center_sec: float, half_span_sec: float, count: int
+    ) -> list[tuple[float, float]] | None:
+        """读取 [center - span, center + span] 区间 count 个点的 (peak, rms)。"""
         with self._lock:
             n = len(self.frames)
             if n == 0:
                 return None
             max_idx = n - 1
-            cur_idx = center_sec * PEAK_FPS
-            if cur_idx > max_idx + 4:
+            if center_sec * PEAK_FPS > max_idx + 12:
                 return None
-            out: list[float] = []
+            out: list[tuple[float, float]] = []
             for i in range(count):
-                # 从左（历史）到右（当前时刻）
-                rel = (i / max(1, count - 1) - 1.0) * span_sec
+                rel = ((i / max(1, count - 1)) * 2.0 - 1.0) * half_span_sec
                 idx = int(round((center_sec + rel) * PEAK_FPS))
                 if 0 <= idx <= max_idx:
-                    out.append(self.frames[idx][0])
+                    out.append((self.frames[idx][0], self.frames[idx][1]))
                 else:
-                    out.append(0.0)
+                    out.append((0.0, 0.0))
             return out
 
 
 class PeakPrecomputer:
-    """后台使用 ffmpeg 极速预计算当前歌曲的 25Hz Peak 包络。"""
+    """后台使用 ffmpeg 极速预计算当前歌曲的 25Hz 波形 Peak 与 24 频段 FFT 频谱。"""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -255,11 +297,10 @@ class PeakPrecomputer:
                 return
             self._proc = proc
 
-        frame_bytes = PEAK_HOP * 2  # s16le -> 2 bytes/sample -> 320 bytes/frame
-        read_chunk = frame_bytes * 5  # 每 200ms 音频批量刷新一次
-        lp1 = 0.0
-        lp2 = 0.0
+        frame_bytes = PEAK_HOP * 2  # 480 samples * 2 bytes = 960 bytes/frame
+        read_chunk = frame_bytes * 5  # 每 200ms 音频刷新一次
         leftover = b""
+        win_offset = (PEAK_HOP - FFT_N) // 2
 
         try:
             assert proc.stdout is not None
@@ -278,34 +319,24 @@ class PeakPrecomputer:
                 if sys.byteorder != "little":
                     pcm.byteswap()
 
-                batch: list[tuple[float, float, float, float, float]] = []
+                batch: list[tuple[float, float, tuple[float, ...]]] = []
                 inv = 1.0 / PEAK_HOP
                 for start in range(0, len(pcm), PEAK_HOP):
                     mx = 0.0
                     s_sq = 0.0
-                    b_sq = 0.0
-                    m_sq = 0.0
-                    h_sq = 0.0
                     for i in range(start, start + PEAK_HOP):
                         x = pcm[i] / 32768.0
                         ax = x if x >= 0.0 else -x
                         if ax > mx:
                             mx = ax
                         s_sq += x * x
-                        lp1 += 0.24 * (x - lp1)
-                        lp2 += 0.68 * (x - lp2)
-                        b = lp1
-                        m = lp2 - lp1
-                        h = x - lp2
-                        b_sq += b * b
-                        m_sq += m * m
-                        h_sq += h * h
                     peak = min(1.0, mx ** 0.72)
                     rms = min(1.0, (math.sqrt(s_sq * inv) ** 0.72) * 1.45)
-                    bass = min(1.0, (math.sqrt(b_sq * inv) ** 0.72) * 1.85)
-                    mid = min(1.0, (math.sqrt(m_sq * inv) ** 0.72) * 2.05)
-                    high = min(1.0, (math.sqrt(h_sq * inv) ** 0.72) * 2.45)
-                    batch.append((peak, rms, bass, mid, high))
+
+                    fft_start = start + win_offset
+                    fft_slice = [pcm[i] / 32768.0 for i in range(fft_start, fft_start + FFT_N)]
+                    bands = _compute_fft_bands(fft_slice)
+                    batch.append((peak, rms, bands))
                 timeline.append_batch(batch)
         except Exception:  # noqa: BLE001
             pass
@@ -361,7 +392,7 @@ class AmbientBrand(Static):
 
 
 class VinylCoverStage(Static):
-    """紧凑版专辑封面 / ASCII 黑胶唱片机慢动画舞台（7 行高）。"""
+    """紧凑版专辑封面 / ASCII 黑胶唱片机慢动画舞台（6 行高）。"""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__("", markup=False, **kwargs)
@@ -438,21 +469,25 @@ class VinylCoverStage(Static):
 
 
 class AmbientWaveVisualizer(Static):
-    """3 行高实时 Peak + 三频段混合 Braille 声浪可视化组件。"""
+    """5 行高真 FFT 频谱柱状图(+Peak 峰值帽) & 真实对称采样波形图。"""
 
-    _DOT_BITS = (
-        (0x01, 0x08),
-        (0x02, 0x10),
-        (0x04, 0x20),
-        (0x40, 0x80),
-    )
+    _BAR_BLOCKS = (" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█")
+    _VIZ_ROWS = 5
+    _SUB_PER_ROW = 8
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__("", markup=False, **kwargs)
-        self._energy: float = 0.16
-        self._col_smooth: list[float] = []
-        self._band_smooth: list[float] = [0.0, 0.0, 0.0, 0.0]  # peak, bass, mid, high
+        self.viz_mode: str = "spectrum"  # "spectrum" | "waveform"
+        self._energy: float = 0.14
+        self._bar_smooth: list[float] = [0.0] * NUM_BANDS
+        self._peak_hold: list[float] = [0.0] * NUM_BANDS
+        self._hold_ticks: list[int] = [0] * NUM_BANDS
+        self._wave_smooth: list[float] = []
         self.render_wave(0.0, state="idle")
+
+    def toggle_mode(self) -> str:
+        self.viz_mode = "waveform" if self.viz_mode == "spectrum" else "spectrum"
+        return self.viz_mode
 
     def render_wave(
         self,
@@ -463,114 +498,204 @@ class AmbientWaveVisualizer(Static):
     ) -> None:
         target = {
             "playing": 1.0,
-            "buffering": 0.55,
-            "paused": 0.22,
-            "idle": 0.16,
-        }.get(state, 0.16)
-        self._energy += (target - self._energy) * 0.16
+            "buffering": 0.45,
+            "paused": 0.16,
+            "idle": 0.12,
+        }.get(state, 0.12)
+        self._energy += (target - self._energy) * 0.18
 
-        width = max(24, min(56, (self.size.width or 36) - 2))
-        sub_cols = width * 2
-        if len(self._col_smooth) != sub_cols:
-            self._col_smooth = [0.08] * sub_cols
+        width = max(24, min(58, (self.size.width or 38) - 2))
+        if self.viz_mode == "waveform":
+            self._render_waveform_mode(t, state, pos, timeline, width)
+        else:
+            self._render_spectrum_mode(t, state, pos, timeline, width)
 
-        live_sample = timeline.sample(pos) if (timeline and state == "playing") else None
-        live_win = timeline.sample_window(pos, 0.9, sub_cols) if (timeline and state == "playing") else None
-
-        if live_sample is not None:
-            pk, rms, bass, mid, high = live_sample
-            for idx, target_v in enumerate((pk, bass, mid, high)):
-                cur = self._band_smooth[idx]
-                rate = 0.65 if target_v > cur else 0.22
-                self._band_smooth[idx] = cur + (target_v - cur) * rate
-            s_peak, s_bass, s_mid, s_high = self._band_smooth
+    def _render_spectrum_mode(
+        self,
+        t: float,
+        state: str,
+        pos: float,
+        timeline: PeakTimeline | None,
+        width: int,
+    ) -> None:
+        spec = timeline.sample_spectrum(pos) if (timeline and state == "playing") else None
+        if spec is not None:
+            _pk, _rms, raw_bands = spec
             has_live = True
         else:
-            for idx in range(4):
-                self._band_smooth[idx] *= 0.85
-            s_peak, s_bass, s_mid, s_high = 0.0, 0.0, 0.0, 0.0
+            # 待机/暂停或尚未解码时保持低矮柔缓的呼吸基线
+            raw_bands = [
+                self._energy * (0.18 + 0.12 * math.sin(t * 1.4 - b * 0.35))
+                for b in range(NUM_BANDS)
+            ]
             has_live = False
 
-        heights: list[float] = []
-        env = self._energy
-        for x in range(sub_cols):
-            nx = x / max(1, sub_cols - 1)
-            window = math.sin(math.pi * nx) ** 0.65
+        # 更新 24 频段平滑柱高 + Peak Hold 峰值帽（瞬间吸顶 -> 短暂停留 -> 匀速缓落）
+        for b in range(NUM_BANDS):
+            val = max(0.02, min(1.0, raw_bands[b]))
+            cur = self._bar_smooth[b]
+            rate = 0.78 if val > cur else 0.28
+            cur = cur + (val - cur) * rate
+            self._bar_smooth[b] = cur
 
-            if has_live and live_win is not None:
-                # 左段偏重 Bass，中段偏重 Mid+实时波形包络，右段偏重 High
-                if nx < 0.33:
-                    band_v = s_bass * (1.0 - nx * 1.2) + s_mid * (nx * 1.2)
-                elif nx < 0.67:
-                    band_v = s_mid * 0.85 + s_peak * 0.35
-                else:
-                    band_v = s_high * ((nx - 0.5) * 1.6) + s_mid * (1.0 - (nx - 0.5))
-
-                # 叠加真实 25Hz 时间窗峰谷波动 + 微小高频谐波纹理
-                win_pk = live_win[x]
-                ripple = 0.08 * math.sin(nx * 18.0 - t * 6.5) * s_high
-                raw_val = window * (0.48 * win_pk + 0.52 * band_v + ripple)
-                raw_val = max(0.04, min(1.0, raw_val))
-                prev = self._col_smooth[x]
-                rate = 0.72 if raw_val > prev else 0.28
-                smoothed = prev + (raw_val - prev) * rate
+            if cur >= self._peak_hold[b]:
+                self._peak_hold[b] = cur
+                self._hold_ticks[b] = 8  # 约 0.4s 悬停
+            elif self._hold_ticks[b] > 0:
+                self._hold_ticks[b] -= 1
             else:
-                # 柔缓待机/暂停呼吸谐波
-                w1 = math.sin(nx * 6.5 - t * 1.15)
-                w2 = 0.55 * math.sin(nx * 11.3 + t * 0.72 + 1.1)
-                w3 = 0.35 * math.cos(nx * 17.0 - t * 0.48 + 2.4)
-                amp = 0.48 + 0.52 * (0.5 + 0.5 * ((w1 + w2 + w3) / 1.9))
-                raw_val = window * env * amp
-                prev = self._col_smooth[x]
-                smoothed = prev + (raw_val - prev) * 0.16
+                self._peak_hold[b] = max(cur, self._peak_hold[b] - 0.026)
 
-            self._col_smooth[x] = smoothed
-            heights.append(max(0.0, min(1.0, smoothed)))
+        # 根据当前宽度排布频谱柱（优先每柱 1 列 + 1 格间距，居中对齐）
+        num_bars = min(NUM_BANDS, max(12, width // 2))
+        step = 2 if num_bars * 2 - 1 <= width else 1
+        total_w = num_bars * step - (1 if step == 2 else 0)
+        left_pad = max(0, (width - total_w) // 2)
 
-        top_chars: list[str] = []
-        mid_chars: list[str] = []
-        for col in range(width):
-            mask_top = 0
-            mask_mid = 0
-            for sub in (0, 1):
-                h = heights[col * 2 + sub]
-                level = int(round(h * 7.0))
-                top_pixel = 7 - level
-                for py in range(top_pixel, 8):
-                    if py < 4:
-                        mask_top |= self._DOT_BITS[py][sub]
-                    else:
-                        mask_mid |= self._DOT_BITS[py - 4][sub]
-            top_chars.append(chr(0x2800 + mask_top))
-            mid_chars.append(chr(0x2800 + mask_mid))
+        # 重采样 24 频段到 num_bars
+        bars_val: list[float] = []
+        bars_pk: list[float] = []
+        for i in range(num_bars):
+            f_idx = i * (NUM_BANDS - 1) / max(1, num_bars - 1)
+            i0 = int(f_idx)
+            i1 = min(NUM_BANDS - 1, i0 + 1)
+            frac = f_idx - i0
+            bars_val.append(self._bar_smooth[i0] * (1.0 - frac) + self._bar_smooth[i1] * frac)
+            bars_pk.append(self._peak_hold[i0] * (1.0 - frac) + self._peak_hold[i1] * frac)
 
-        phase = t * 0.05
+        max_px = self._VIZ_ROWS * self._SUB_PER_ROW  # 40 levels (0..40)
+        phase = t * 0.04
         out = Text(no_wrap=True)
 
-        # 峰值越亮时颜色越趋向暖光高亮
-        boost = 0.22 * s_peak if has_live else 0.0
-        for i, ch in enumerate(top_chars):
-            c_phase = phase + i / max(1, width) * 0.55
-            br = min(1.2, 0.55 + 0.45 * env + boost)
-            out.append(ch, style=pastel_hex(c_phase, brightness=br))
-        out.append("\n")
+        for row in range(self._VIZ_ROWS):
+            # row 0 是最顶行 (px 32..40), row 4 是最底行 (px 0..8)
+            row_bot = (self._VIZ_ROWS - 1 - row) * self._SUB_PER_ROW
+            row_top = row_bot + self._SUB_PER_ROW
+            if left_pad > 0:
+                out.append(" " * left_pad)
 
-        for i, ch in enumerate(mid_chars):
-            c_phase = phase + 0.08 + i / max(1, width) * 0.55
-            br = min(1.2, 0.65 + 0.35 * env + boost * 0.8)
-            out.append(ch, style=pastel_hex(c_phase, brightness=br))
-        out.append("\n")
+            for i in range(num_bars):
+                h_px = int(round(bars_val[i] * max_px))
+                pk_px = int(round(bars_pk[i] * max_px))
+                pk_px = max(1, min(max_px, pk_px))
 
+                c_phase = phase + (i / max(1, num_bars - 1)) * 0.65
+                # 顶部亮度高、底部柔和
+                row_bright = 0.65 + 0.45 * ((self._VIZ_ROWS - 1 - row) / max(1, self._VIZ_ROWS - 1))
+
+                # 先判断 Peak 峰值帽是否落在本行（且位于柱体上方或顶端）
+                pk_in_row = row_bot < pk_px <= row_top
+                if h_px >= row_top:
+                    ch = "█"
+                    style = pastel_hex(c_phase, brightness=row_bright)
+                elif h_px > row_bot:
+                    frac_sub = h_px - row_bot
+                    ch = self._BAR_BLOCKS[frac_sub]
+                    style = pastel_hex(c_phase, brightness=row_bright)
+                elif pk_in_row and has_live:
+                    # 独立悬空 Peak 峰值帽：根据亚像素位置选 ▁ / ▂ / ▔
+                    sub_pos = pk_px - row_bot
+                    ch = "▔" if sub_pos >= 6 else ("─" if sub_pos >= 3 else "▁")
+                    style = f"bold {pastel_hex(c_phase + 0.08, brightness=1.18)}"
+                elif row == self._VIZ_ROWS - 1:
+                    ch = "▁"
+                    style = pastel_hex(c_phase, brightness=0.32)
+                else:
+                    ch = " "
+                    style = ""
+
+                if style:
+                    out.append(ch, style=style)
+                else:
+                    out.append(" ")
+
+                if step == 2 and i < num_bars - 1:
+                    out.append(" ")
+
+            if row < self._VIZ_ROWS - 1:
+                out.append("\n")
+
+        self.update(out)
+
+    def _render_waveform_mode(
+        self,
+        t: float,
+        state: str,
+        pos: float,
+        timeline: PeakTimeline | None,
+        width: int,
+    ) -> None:
+        win = timeline.sample_waveform(pos, 2.6, width) if (timeline and state != "idle") else None
+        if len(self._wave_smooth) != width:
+            self._wave_smooth = [0.06] * width
+
+        center = width // 2
+        vals: list[float] = []
         for i in range(width):
-            nx = i / max(1, width - 1)
-            win = math.sin(math.pi * nx)
-            if win < 0.12:
-                out.append(" ")
-                continue
-            col_h = (heights[i * 2] + heights[i * 2 + 1]) * 0.5
-            r_ch = "━" if (has_live and col_h > 0.65) else ("─" if col_h > 0.32 else "·")
-            c_phase = phase + 0.15 + nx * 0.55
-            out.append(r_ch, style=pastel_hex(c_phase, brightness=0.28 + 0.45 * col_h * win))
+            if win is not None:
+                pk, rms = win[i]
+                raw = 0.65 * pk + 0.35 * rms
+                prev = self._wave_smooth[i]
+                sm = prev + (raw - prev) * 0.55
+            else:
+                nx = i / max(1, width - 1)
+                raw = self._energy * (0.2 + 0.16 * math.sin(nx * 10.0 - t * 2.0)) * math.sin(math.pi * nx)
+                sm = raw
+            self._wave_smooth[i] = sm
+            vals.append(max(0.03, min(1.0, sm)))
+
+        # 5 行对称波形：row 2 为中心轴，row 0..1 向上，row 3..4 向下
+        # 每侧 2.5 行 ≈ 20 级纵向精度
+        half_px = 20
+        phase = t * 0.04
+        out = Text(no_wrap=True)
+
+        for row in range(self._VIZ_ROWS):
+            for i in range(width):
+                amp_px = max(1, int(round(vals[i] * half_px)))
+                is_past = i <= center
+                is_head = i == center
+
+                c_phase = phase + (i / max(1, width - 1)) * 0.55
+                if is_head and state == "playing":
+                    ch = "┃"
+                    style = "bold #f7e3d4"
+                else:
+                    br = 0.98 if is_past else 0.42
+                    style = pastel_hex(c_phase, brightness=br)
+                    if row == 2:
+                        # 中心对称轴始终充实
+                        ch = "█" if amp_px >= 4 else ("▆" if amp_px >= 2 else "━")
+                    elif row < 2:
+                        # 上半部：row 1 (4..12), row 0 (12..20)
+                        dist_bot = (1 - row) * 8 + 4
+                        dist_top = dist_bot + 8
+                        if amp_px >= dist_top:
+                            ch = "█"
+                        elif amp_px > dist_bot:
+                            ch = self._BAR_BLOCKS[amp_px - dist_bot]
+                        else:
+                            ch = " "
+                    else:
+                        # 下半部对称镜像：row 3 (4..12), row 4 (12..20)
+                        dist_bot = (row - 3) * 8 + 4
+                        dist_top = dist_bot + 8
+                        if amp_px >= dist_top:
+                            ch = "█"
+                        elif amp_px > dist_bot:
+                            # 下半部用上对齐方块 ▀/upper 或柔和点阵，使上下镜像干净
+                            sub = amp_px - dist_bot
+                            ch = "█" if sub >= 6 else ("▀" if sub >= 3 else "▔")
+                        else:
+                            ch = " "
+
+                if ch == " ":
+                    out.append(" ")
+                else:
+                    out.append(ch, style=style)
+
+            if row < self._VIZ_ROWS - 1:
+                out.append("\n")
 
         self.update(out)
 
@@ -869,10 +994,10 @@ class NcmTuiApp(App):
     }
 
     #wave-viz {
-        height: 3;
+        height: 5;
         content-align: center middle;
         text-align: center;
-        margin: 0;
+        margin: 0 1;
     }
 
     #lyric-scroll {
@@ -975,9 +1100,10 @@ class NcmTuiApp(App):
         Binding("full_stop", "seek_fwd_15", "快进15s", show=False),
         Binding("s", "toggle_shuffle", "随机/顺序"),
         Binding("x", "shuffle_current_playlist", "随机播当前歌单"),
+        Binding("v", "toggle_viz_mode", "频谱/波形"),
         Binding("1", "toggle_playlists", "歌单栏"),
         Binding("2", "toggle_cover", "封面"),
-        Binding("3", "toggle_visualizer", "声波"),
+        Binding("3", "toggle_visualizer", "可视化"),
         Binding("0", "reset_layout", "还原面板"),
         Binding("slash", "focus_filter", "搜索"),
         Binding("escape", "clear_filter", "清除搜索", show=False),
@@ -1069,7 +1195,6 @@ class NcmTuiApp(App):
     async def on_mount(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._player = MpvPlayer(on_track_end=self._on_mpv_track_end)
-        # 20 FPS 主循环驱动高实时性 Peak 可视化与进度条，慢动画内部按帧率节流
         self._tick_timer = self.set_interval(0.05, self._tick_player_ui)
         asyncio.create_task(self._bootstrap())
 
@@ -1284,14 +1409,13 @@ class NcmTuiApp(App):
         size_mb = round((info.get("size") or 0) / 1048576, 1)
         self.query_one("#now-quality", Static).update(f"✦ {lv} · {fmt} · {br}kbps · {size_mb}MB")
 
-        # 启动流式 Peak 预计算（优先命中内存缓存）
         tid = int(track["id"])
         cached_peaks = self._peak_cache.get(tid)
         if cached_peaks is not None:
             self._current_peaks = cached_peaks
         else:
             timeline = PeakTimeline()
-            if len(self._peak_cache) >= 16:
+            if len(self._peak_cache) >= 12:
                 self._peak_cache.pop(next(iter(self._peak_cache)))
             self._peak_cache[tid] = timeline
             self._current_peaks = timeline
@@ -1422,7 +1546,6 @@ class NcmTuiApp(App):
         if dur <= 0 and self.current_track:
             dur = (self.current_track.get("duration_ms") or 0) / 1000.0
 
-        # 根据单调时间戳平滑内插播放位置，实现 20 FPS 贴合节拍的零卡顿同步
         pos = st.time_pos
         if is_actively_playing and st.time_pos_at > 0:
             delta = max(0.0, min(0.35, now - st.time_pos_at))
@@ -1430,7 +1553,7 @@ class NcmTuiApp(App):
             if dur > 0:
                 pos = min(dur, pos)
 
-        # 高实时性部分：每帧 (20 FPS) 刷新声波可视化与进度条
+        # 20 FPS 实时刷新真 FFT 频谱 / 对称波形 与 进度条
         if self.show_visualizer:
             wave_state = (
                 "buffering"
@@ -1443,7 +1566,7 @@ class NcmTuiApp(App):
         time_cur.update(fmt_time(pos))
         time_dur.update(fmt_time(dur))
 
-        # 慢动画与状态装饰：每 3 帧 (~6.7 FPS) 刷新一次，节省 CPU
+        # 慢动画与状态装饰 (~6.7 FPS)
         if self._tick_count % 3 == 0:
             brand.render_frame(t, playing=is_actively_playing)
             if self.show_cover:
@@ -1474,10 +1597,11 @@ class NcmTuiApp(App):
             elif st.playing:
                 eq = eq_frames[int(t * 3.0) % 4]
                 status_text.append(f"{eq} ", style=pastel_hex(t * 0.05, brightness=1.0))
+                mode_tag = "FFT频谱" if wave_viz.viz_mode == "spectrum" else "波形"
                 if self._current_peaks and self._current_peaks.done:
-                    status_text.append("播放中·Peak就绪", style=FG_MINT)
+                    status_text.append(f"播放中·{mode_tag}就绪", style=FG_MINT)
                 else:
-                    status_text.append("播放中", style=FG_MINT)
+                    status_text.append(f"播放中·{mode_tag}", style=FG_MINT)
             else:
                 status_text.append("✧ 待机", style=FG_MUTED)
             status_lbl.update(status_text)
@@ -1514,12 +1638,24 @@ class NcmTuiApp(App):
                         force=True,
                     )
 
-    # ── 面板开关与布局控制 ───────────────────────────────────────────────────
+    # ── 面板开关与可视化模式切换 ──────────────────────────────────────────────
     def _apply_panel_visibility(self) -> None:
         self.query_one("#left-pane").set_class(not self.show_playlists, "hidden-pane")
         self.query_one("#cover-box").set_class(not self.show_cover, "hidden-pane")
         self.query_one("#cover-aura").set_class(not self.show_cover, "hidden-pane")
         self.query_one("#wave-viz").set_class(not self.show_visualizer, "hidden-pane")
+
+    def action_toggle_viz_mode(self) -> None:
+        viz = self.query_one("#wave-viz", AmbientWaveVisualizer)
+        if not self.show_visualizer:
+            self.show_visualizer = True
+            self._apply_panel_visibility()
+        mode = viz.toggle_mode()
+        self.notify(
+            "可视化模式: 真 FFT 频谱图 (+Peak 峰值帽)"
+            if mode == "spectrum"
+            else "可视化模式: 真实对称采样波形图"
+        )
 
     def action_toggle_playlists(self) -> None:
         self.show_playlists = not self.show_playlists
