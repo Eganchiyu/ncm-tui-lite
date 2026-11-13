@@ -20,6 +20,7 @@ class PlayerState:
     paused: bool = False
     buffering: bool = False
     time_pos: float = 0.0
+    time_pos_at: float = 0.0
     duration: float = 0.0
     volume: float = 100.0
 
@@ -124,12 +125,15 @@ class MpvPlayer:
                     with self._lock:
                         if name == "time-pos" and isinstance(val, (int, float)):
                             self._state.time_pos = max(0.0, float(val))
+                            self._state.time_pos_at = time.monotonic()
                         elif name == "duration" and isinstance(val, (int, float)):
                             self._state.duration = max(0.0, float(val))
                         elif name == "pause" and isinstance(val, bool):
                             self._state.paused = val
+                            self._state.time_pos_at = time.monotonic()
                         elif name == "paused-for-cache" and isinstance(val, bool):
                             self._state.buffering = val
+                            self._state.time_pos_at = time.monotonic()
                         elif name == "volume" and isinstance(val, (int, float)):
                             self._state.volume = float(val)
                         elif name == "idle-active" and isinstance(val, bool):
@@ -173,6 +177,7 @@ class MpvPlayer:
     def play(self, url: str) -> bool:
         with self._lock:
             self._state.time_pos = 0.0
+            self._state.time_pos_at = time.monotonic()
             self._state.duration = 0.0
             self._state.buffering = True
             self._state.paused = False
@@ -225,6 +230,7 @@ class MpvPlayer:
                 paused=self._state.paused,
                 buffering=self._state.buffering,
                 time_pos=self._state.time_pos,
+                time_pos_at=self._state.time_pos_at,
                 duration=self._state.duration,
                 volume=self._state.volume,
             )

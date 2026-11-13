@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""ncm-lite TUI —— 网易云音乐无损流媒体终端播放器（柔光慢动画版）。"""
+"""ncm-lite TUI —— 网易云音乐无损流媒体终端播放器（柔光慢动画 + 实时声波版）。"""
 from __future__ import annotations
 
+import array
 import asyncio
 import bisect
 import math
 import random
+import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -30,7 +33,6 @@ PASTEL_RING: tuple[tuple[int, int, int], ...] = (
     (235, 211, 167),  # #ebd3a7 奶油淡金
 )
 
-BG_STAGE = "#171a29"
 FG_PRIMARY = "#dde2f2"
 FG_SECONDARY = "#97a1c4"
 FG_MUTED = "#677196"
@@ -39,6 +41,10 @@ FG_LAVENDER = "#b4a7e5"
 FG_ROSE = "#e89eb8"
 FG_PEACH = "#f0b7a4"
 FG_CREAM = "#ebd3a7"
+
+PEAK_SR = 4000
+PEAK_HOP = 160  # 40ms/frame -> 25 FPS
+PEAK_FPS = PEAK_SR / PEAK_HOP  # 25.0
 
 
 def _clamp_u8(v: float) -> int:
@@ -49,7 +55,6 @@ def _lerp_rgb(
     c1: tuple[int, int, int], c2: tuple[int, int, int], t: float
 ) -> tuple[int, int, int]:
     t = max(0.0, min(1.0, t))
-    # 余弦缓动，让色相过渡更加柔顺
     eased = 0.5 - 0.5 * math.cos(math.pi * t)
     return (
         _clamp_u8(c1[0] + (c2[0] - c1[0]) * eased),
@@ -59,7 +64,7 @@ def _lerp_rgb(
 
 
 def sample_pastel(phase: float) -> tuple[int, int, int]:
-    """从闭合的柔和粉彩环中平滑取色（phase 为任意实数，周期为 1.0）。"""
+    """从闭合的柔和粉彩环中平滑取色（phase 周期为 1.0）。"""
     n = len(PASTEL_RING)
     pos = (phase % 1.0) * n
     idx = int(pos) % n
@@ -67,14 +72,9 @@ def sample_pastel(phase: float) -> tuple[int, int, int]:
     return _lerp_rgb(PASTEL_RING[idx], PASTEL_RING[nxt], pos - int(pos))
 
 
-def rgb_hex(rgb: tuple[int, int, int]) -> str:
-    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
-
-
 def pastel_hex(phase: float, brightness: float = 1.0) -> str:
     r, g, b = sample_pastel(phase)
     if brightness != 1.0:
-        # 向深暮色基底 (#171a29) 柔和收敛，避免偏灰发脏
         base = (23, 26, 41)
         f = max(0.0, min(1.25, brightness))
         r = _clamp_u8(base[0] + (r - base[0]) * f)
@@ -112,6 +112,218 @@ def fmt_time(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+# ── 流式音频 Peak 预计算引擎 ─────────────────────────────────────────────────
+class PeakTimeline:
+    """线程安全的渐进式音频 Peak / 三频段时间轴（25Hz）。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.frames: list[tuple[float, float, float, float, float]] = []
+        self.done: bool = False
+
+    def append_batch(self, batch: list[tuple[float, float, float, float, float]]) -> None:
+        if not batch:
+            return
+        with self._lock:
+            self.frames.extend(batch)
+
+    def mark_done(self) -> None:
+        with self._lock:
+            self.done = True
+
+    def sample(self, sec: float) -> tuple[float, float, float, float, float] | None:
+        """线性插值读取指定秒数的 (peak, rms, bass, mid, high)。"""
+        if sec < 0:
+            sec = 0.0
+        idx_f = sec * PEAK_FPS
+        idx0 = int(idx_f)
+        frac = idx_f - idx0
+        with self._lock:
+            n = len(self.frames)
+            if n == 0 or idx0 >= n:
+                return None
+            f0 = self.frames[idx0]
+            if idx0 + 1 >= n:
+                return f0
+            f1 = self.frames[idx0 + 1]
+        return (
+            f0[0] + (f1[0] - f0[0]) * frac,
+            f0[1] + (f1[1] - f0[1]) * frac,
+            f0[2] + (f1[2] - f0[2]) * frac,
+            f0[3] + (f1[3] - f0[3]) * frac,
+            f0[4] + (f1[4] - f0[4]) * frac,
+        )
+
+    def sample_window(
+        self, center_sec: float, span_sec: float, count: int
+    ) -> list[float] | None:
+        """读取 [center_sec - span_sec, center_sec] 区间内 count 个均匀峰谷点。"""
+        with self._lock:
+            n = len(self.frames)
+            if n == 0:
+                return None
+            max_idx = n - 1
+            cur_idx = center_sec * PEAK_FPS
+            if cur_idx > max_idx + 4:
+                return None
+            out: list[float] = []
+            for i in range(count):
+                # 从左（历史）到右（当前时刻）
+                rel = (i / max(1, count - 1) - 1.0) * span_sec
+                idx = int(round((center_sec + rel) * PEAK_FPS))
+                if 0 <= idx <= max_idx:
+                    out.append(self.frames[idx][0])
+                else:
+                    out.append(0.0)
+            return out
+
+
+class PeakPrecomputer:
+    """后台使用 ffmpeg 极速预计算当前歌曲的 25Hz Peak 包络。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._stop_flag = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self, url: str, timeline: PeakTimeline) -> None:
+        self.cancel()
+        self._stop_flag = threading.Event()
+        ev = self._stop_flag
+        self._thread = threading.Thread(
+            target=self._worker, args=(url, timeline, ev), daemon=True
+        )
+        self._thread.start()
+
+    def cancel(self) -> None:
+        self._stop_flag.set()
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=0.5)
+            except Exception:  # noqa: BLE001
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _worker(self, url: str, timeline: PeakTimeline, stop_ev: threading.Event) -> None:
+        cmd = [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-user_agent",
+            ncm.UA_WEB,
+            "-headers",
+            f"Referer: {ncm.REFERER}\r\n",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "2",
+            "-i",
+            url,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(PEAK_SR),
+            "-f",
+            "s16le",
+            "pipe:1",
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:  # noqa: BLE001
+            timeline.mark_done()
+            return
+
+        with self._lock:
+            if stop_ev.is_set():
+                proc.terminate()
+                return
+            self._proc = proc
+
+        frame_bytes = PEAK_HOP * 2  # s16le -> 2 bytes/sample -> 320 bytes/frame
+        read_chunk = frame_bytes * 5  # 每 200ms 音频批量刷新一次
+        lp1 = 0.0
+        lp2 = 0.0
+        leftover = b""
+
+        try:
+            assert proc.stdout is not None
+            while not stop_ev.is_set():
+                chunk = proc.stdout.read(read_chunk)
+                if not chunk:
+                    break
+                buf = leftover + chunk
+                usable = (len(buf) // frame_bytes) * frame_bytes
+                leftover = buf[usable:]
+                if usable == 0:
+                    continue
+
+                pcm = array.array("h")
+                pcm.frombytes(buf[:usable])
+                if sys.byteorder != "little":
+                    pcm.byteswap()
+
+                batch: list[tuple[float, float, float, float, float]] = []
+                inv = 1.0 / PEAK_HOP
+                for start in range(0, len(pcm), PEAK_HOP):
+                    mx = 0.0
+                    s_sq = 0.0
+                    b_sq = 0.0
+                    m_sq = 0.0
+                    h_sq = 0.0
+                    for i in range(start, start + PEAK_HOP):
+                        x = pcm[i] / 32768.0
+                        ax = x if x >= 0.0 else -x
+                        if ax > mx:
+                            mx = ax
+                        s_sq += x * x
+                        lp1 += 0.24 * (x - lp1)
+                        lp2 += 0.68 * (x - lp2)
+                        b = lp1
+                        m = lp2 - lp1
+                        h = x - lp2
+                        b_sq += b * b
+                        m_sq += m * m
+                        h_sq += h * h
+                    peak = min(1.0, mx ** 0.72)
+                    rms = min(1.0, (math.sqrt(s_sq * inv) ** 0.72) * 1.45)
+                    bass = min(1.0, (math.sqrt(b_sq * inv) ** 0.72) * 1.85)
+                    mid = min(1.0, (math.sqrt(m_sq * inv) ** 0.72) * 2.05)
+                    high = min(1.0, (math.sqrt(h_sq * inv) ** 0.72) * 2.45)
+                    batch.append((peak, rms, bass, mid, high))
+                timeline.append_batch(batch)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            timeline.mark_done()
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=0.5)
+            except Exception:  # noqa: BLE001
+                pass
+            with self._lock:
+                if self._proc is proc:
+                    self._proc = None
+
+
 # ── 慢动画 & ASCII 艺术组件 ──────────────────────────────────────────────────
 class AmbientBrand(Static):
     """顶部柔光极光渐变品牌条 + 慢漂浮音符星尘。"""
@@ -124,7 +336,7 @@ class AmbientBrand(Static):
         self.render_frame(0.0, playing=False)
 
     def render_frame(self, t: float, playing: bool) -> None:
-        phase = t * 0.035  # 约 28 秒完成一轮柔和全色环流转
+        phase = t * 0.035
         note_idx = int(t * (0.7 if playing else 0.3)) % len(self._NOTES)
         note = self._NOTES[note_idx]
         pulse = 0.82 + 0.18 * math.sin(t * 1.4)
@@ -132,15 +344,14 @@ class AmbientBrand(Static):
         out = Text(no_wrap=True)
         out.append(f" {note} ", style=f"bold {pastel_hex(phase, pulse)}")
         out.append_text(gradient_text("ncm-lite", phase + 0.08, spread=0.045, bold=True))
-        out.append("  ·  ", style=FG_MUTED)
+        out.append(" · ", style=FG_MUTED)
         out.append("柔光无损音流", style=FG_SECONDARY)
 
-        # 慢漂移的尾迹星尘
         motes = self._MOTES
         shift = int(t * (2.2 if playing else 1.0)) % len(motes)
         scrolled = motes[shift:] + motes[:shift]
-        out.append("   ")
-        for i, ch in enumerate(scrolled[:18]):
+        out.append("  ")
+        for i, ch in enumerate(scrolled[:16]):
             if ch == " ":
                 out.append(" ")
             else:
@@ -150,18 +361,7 @@ class AmbientBrand(Static):
 
 
 class VinylCoverStage(Static):
-    """专辑封面 / ASCII 黑胶唱片机慢动画舞台。"""
-
-    _FRAME_LINES = (
-        "    {s0}   ╭─────────────────────────╮   {s1} ",
-        "  {s2}   │  ╭─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─╮  │     ",
-        "    ╭──┴──╯   {g0} ╭─────────╮ {g1}   ╰──┴──╮",
-        "    │  ╭────  {g2} │  ( ◎ )  │ {g3}  ──╮  │ {arm0}",
-        "    │  │ {g4}   ╰─────────╯   {g5} │  │ {arm1}",
-        "    │  ╰────  {g6} ╌ ╌ ╌ ╌ ╌ {g7}  ────╯  │ {arm2}",
-        "    │     ╰─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─╯     │ {arm3}",
-        "    ╰─────────────────────────────────╯   ",
-    )
+    """紧凑版专辑封面 / ASCII 黑胶唱片机慢动画舞台（7 行高）。"""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__("", markup=False, **kwargs)
@@ -183,40 +383,27 @@ class VinylCoverStage(Static):
         phase = t * 0.04
         ring_step = int(t * speed * 4.0) % 8
 
-        # 唱片光影纹路缓慢旋转
         groove_chars = ("╱", "│", "╲", "─", "╱", "│", "╲", "─")
-        g = [groove_chars[(ring_step + i) % 8] for i in range(8)]
+        g = [groove_chars[(ring_step + i) % 8] for i in range(6)]
 
-        # 四周缓闪星点
         star_set = ("✦", "·", "˚", "✧", "·", " ")
-        stars = []
-        for idx in range(3):
-            s_idx = int(t * 0.65 + idx * 2.1) % len(star_set)
-            stars.append(star_set[s_idx])
-
-        # 唱臂：待机时收起，加载/播放时轻搭在碟片上
-        if status in ("playing", "loading"):
-            arms = ("◎", "╱", "╱", "╰")
-        else:
-            arms = ("◎", "│", "│", " ")
+        stars = [star_set[int(t * 0.65 + idx * 2.1) % len(star_set)] for idx in range(2)]
+        arms = ("◎", "╱", "╰") if status in ("playing", "loading") else ("◎", "│", " ")
 
         caption_map = {
-            "idle": "·  s l o w   v i n y l   d r i f t  ·",
-            "loading": "◐  w a k i n g   l o s s l e s s   s t r e a m  ◑",
-            "playing": "♫  a n a l o g   p a s t e l   a u r a  ♫",
-            "error": "·  n o   c o v e r   a r t w o r k  ·",
+            "idle": "· s l o w   v i n y l   d r i f t ·",
+            "loading": "◐ w a k i n g   s t r e a m ◑",
+            "playing": "♫ a n a l o g   p a s t e l ♫",
+            "error": "· n o   c o v e r   a r t ·",
         }
         caption = caption_map.get(status, caption_map["idle"])
 
         lines = [
-            f"    {stars[0]}   ╭─────────────────────────╮   {stars[1]} ",
-            f"  {stars[2]}   │  ╭─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─╮  │     ",
-            f"    ╭──┴──╯   {g[0]} ╭─────────╮ {g[1]}   ╰──┴──╮",
-            f"    │  ╭────  {g[2]} │  ( ◎ )  │ {g[3]}  ──╮  │ {arms[0]}",
-            f"    │  │ {g[4]}     ╰─────────╯     {g[5]} │  │ {arms[1]}",
-            f"    │  ╰────  {g[6]} ╌ ╌ ╌ ╌ ╌ {g[7]}  ────╯  │ {arms[2]}",
-            f"    │     ╰─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─╯     │ {arms[3]}",
-            "    ╰─────────────────────────────────╯   ",
+            f"  {stars[0]}  ╭───────────────────────────╮  {stars[1]} ",
+            f"   ╭─┴─╮   {g[0]}  ╭───────────╮  {g[1]}   ╭─┴─╮",
+            f"   │ ╭─╯ {g[2]}   │   ( ◎ )   │   {g[3]} ╰─╮ │ {arms[0]}",
+            f"   │ ╰─╮ {g[4]}   ╰───────────╯   {g[5]} ╭─╯ │ {arms[1]}",
+            f"   ╰───┴─────── ╌ ╌ ╌ ╌ ╌ ───────┴───╯ {arms[2]}",
         ]
 
         out = Text()
@@ -227,26 +414,23 @@ class VinylCoverStage(Static):
                 elif ch in ("✦", "✧", "˚", "·"):
                     tw = 0.55 + 0.45 * math.sin(t * 1.3 + row_idx + col_idx * 0.3)
                     out.append(ch, style=pastel_hex(phase + 0.45 + row_idx * 0.07, brightness=tw))
-                elif ch in ("◎",):
-                    out.append(ch, style=f"bold {pastel_hex(phase + 0.15, brightness=1.05)}")
-                elif ch in ("╱", "╲", "│", "─", "╌") and 12 <= col_idx <= 30 and 2 <= row_idx <= 5:
-                    # 唱片沟槽反光带
+                elif ch == "◎":
+                    out.append(ch, style=f"bold {pastel_hex(phase + 0.15, brightness=1.08)}")
+                elif ch in ("╱", "╲", "│", "─", "╌") and 10 <= col_idx <= 32 and 1 <= row_idx <= 4:
                     shimmer = 0.65 + 0.35 * math.sin(t * 1.1 - col_idx * 0.25 + row_idx * 0.5)
                     out.append(ch, style=pastel_hex(phase + col_idx * 0.025, brightness=shimmer))
-                elif ch in ("╭", "╮", "╰", "╯", "┴") and row_idx in (2, 3, 4, 5) and 14 <= col_idx <= 28:
+                elif ch in ("╭", "╮", "╰", "╯") and row_idx in (1, 2, 3) and 13 <= col_idx <= 27:
                     out.append(ch, style=pastel_hex(phase + 0.28, brightness=0.88))
                 else:
-                    # 柔灰紫机身外框
-                    out.append(ch, style=pastel_hex(phase + row_idx * 0.02, brightness=0.52))
+                    out.append(ch, style=pastel_hex(phase + row_idx * 0.03, brightness=0.52))
             out.append("\n")
 
-        # 底部呼吸感字母标语
-        out.append("   ")
+        out.append("  ")
         out.append_text(
             gradient_text(
                 caption,
                 phase + 0.2,
-                spread=0.022,
+                spread=0.024,
                 brightness=0.72 + 0.22 * math.sin(t * 0.9),
             )
         )
@@ -254,9 +438,8 @@ class VinylCoverStage(Static):
 
 
 class AmbientWaveVisualizer(Static):
-    """3 行超细腻 Braille 慢速谐波声浪可视化组件。"""
+    """3 行高实时 Peak + 三频段混合 Braille 声浪可视化组件。"""
 
-    # Braille 点阵映射: (col 0..1, row 0..3) -> bit
     _DOT_BITS = (
         (0x01, 0x08),
         (0x02, 0x10),
@@ -267,36 +450,83 @@ class AmbientWaveVisualizer(Static):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__("", markup=False, **kwargs)
         self._energy: float = 0.16
+        self._col_smooth: list[float] = []
+        self._band_smooth: list[float] = [0.0, 0.0, 0.0, 0.0]  # peak, bass, mid, high
         self.render_wave(0.0, state="idle")
 
-    def render_wave(self, t: float, state: str = "idle") -> None:
+    def render_wave(
+        self,
+        t: float,
+        state: str = "idle",
+        pos: float = 0.0,
+        timeline: PeakTimeline | None = None,
+    ) -> None:
         target = {
             "playing": 1.0,
-            "buffering": 0.62,
-            "paused": 0.24,
+            "buffering": 0.55,
+            "paused": 0.22,
             "idle": 0.16,
         }.get(state, 0.16)
-        self._energy += (target - self._energy) * 0.10
+        self._energy += (target - self._energy) * 0.16
 
-        width = max(24, min(52, (self.size.width or 36) - 2))
+        width = max(24, min(56, (self.size.width or 36) - 2))
         sub_cols = width * 2
-        # 2 行 Braille 共 8 个垂直子像素级别 (0..7)
-        # 计算上下对称或平滑流动的复合慢谐波
+        if len(self._col_smooth) != sub_cols:
+            self._col_smooth = [0.08] * sub_cols
+
+        live_sample = timeline.sample(pos) if (timeline and state == "playing") else None
+        live_win = timeline.sample_window(pos, 0.9, sub_cols) if (timeline and state == "playing") else None
+
+        if live_sample is not None:
+            pk, rms, bass, mid, high = live_sample
+            for idx, target_v in enumerate((pk, bass, mid, high)):
+                cur = self._band_smooth[idx]
+                rate = 0.65 if target_v > cur else 0.22
+                self._band_smooth[idx] = cur + (target_v - cur) * rate
+            s_peak, s_bass, s_mid, s_high = self._band_smooth
+            has_live = True
+        else:
+            for idx in range(4):
+                self._band_smooth[idx] *= 0.85
+            s_peak, s_bass, s_mid, s_high = 0.0, 0.0, 0.0, 0.0
+            has_live = False
+
         heights: list[float] = []
         env = self._energy
         for x in range(sub_cols):
             nx = x / max(1, sub_cols - 1)
-            # 两端平滑衰减窗函数（Hann 窗）
-            window = math.sin(math.pi * nx) ** 0.75
-            w1 = math.sin(nx * 6.5 - t * 1.15)
-            w2 = 0.55 * math.sin(nx * 11.3 + t * 0.72 + 1.1)
-            w3 = 0.35 * math.cos(nx * 17.0 - t * 0.48 + 2.4)
-            # 平滑包络，在 0.08..1.0 之间柔和呼吸
-            amp = (0.48 + 0.52 * (0.5 + 0.5 * ((w1 + w2 + w3) / 1.9)))
-            val = window * env * amp
-            heights.append(max(0.0, min(1.0, val)))
+            window = math.sin(math.pi * nx) ** 0.65
 
-        # 构造 2 行 Braille 矩阵 (row 0 为上半峰，row 1 为下半柔波)
+            if has_live and live_win is not None:
+                # 左段偏重 Bass，中段偏重 Mid+实时波形包络，右段偏重 High
+                if nx < 0.33:
+                    band_v = s_bass * (1.0 - nx * 1.2) + s_mid * (nx * 1.2)
+                elif nx < 0.67:
+                    band_v = s_mid * 0.85 + s_peak * 0.35
+                else:
+                    band_v = s_high * ((nx - 0.5) * 1.6) + s_mid * (1.0 - (nx - 0.5))
+
+                # 叠加真实 25Hz 时间窗峰谷波动 + 微小高频谐波纹理
+                win_pk = live_win[x]
+                ripple = 0.08 * math.sin(nx * 18.0 - t * 6.5) * s_high
+                raw_val = window * (0.48 * win_pk + 0.52 * band_v + ripple)
+                raw_val = max(0.04, min(1.0, raw_val))
+                prev = self._col_smooth[x]
+                rate = 0.72 if raw_val > prev else 0.28
+                smoothed = prev + (raw_val - prev) * rate
+            else:
+                # 柔缓待机/暂停呼吸谐波
+                w1 = math.sin(nx * 6.5 - t * 1.15)
+                w2 = 0.55 * math.sin(nx * 11.3 + t * 0.72 + 1.1)
+                w3 = 0.35 * math.cos(nx * 17.0 - t * 0.48 + 2.4)
+                amp = 0.48 + 0.52 * (0.5 + 0.5 * ((w1 + w2 + w3) / 1.9))
+                raw_val = window * env * amp
+                prev = self._col_smooth[x]
+                smoothed = prev + (raw_val - prev) * 0.16
+
+            self._col_smooth[x] = smoothed
+            heights.append(max(0.0, min(1.0, smoothed)))
+
         top_chars: list[str] = []
         mid_chars: list[str] = []
         for col in range(width):
@@ -304,11 +534,7 @@ class AmbientWaveVisualizer(Static):
             mask_mid = 0
             for sub in (0, 1):
                 h = heights[col * 2 + sub]
-                # 映射至 0..7 像素高度（从底行向上填充）
                 level = int(round(h * 7.0))
-                # row 1 (mid_chars): 子行 0..3（top=0..bottom=3），仅取上半部形成柔波轮廓
-                # 实际上把 8 级从底部 row=7 往上画到 row=7-level：
-                # 这样两行拼成连续的 8-pixel 高精细波形！
                 top_pixel = 7 - level
                 for py in range(top_pixel, 8):
                     if py < 4:
@@ -321,32 +547,30 @@ class AmbientWaveVisualizer(Static):
         phase = t * 0.05
         out = Text(no_wrap=True)
 
-        # 第一行：波峰柔光
+        # 峰值越亮时颜色越趋向暖光高亮
+        boost = 0.22 * s_peak if has_live else 0.0
         for i, ch in enumerate(top_chars):
             c_phase = phase + i / max(1, width) * 0.55
-            br = 0.55 + 0.45 * env
+            br = min(1.2, 0.55 + 0.45 * env + boost)
             out.append(ch, style=pastel_hex(c_phase, brightness=br))
         out.append("\n")
 
-        # 第二行：波腹主体
         for i, ch in enumerate(mid_chars):
             c_phase = phase + 0.08 + i / max(1, width) * 0.55
-            br = 0.65 + 0.35 * env
+            br = min(1.2, 0.65 + 0.35 * env + boost * 0.8)
             out.append(ch, style=pastel_hex(c_phase, brightness=br))
         out.append("\n")
 
-        # 第三行：水面倒影地平线
-        ripple_chars = ("·", "╌", "─", "┄", " ")
         for i in range(width):
             nx = i / max(1, width - 1)
             win = math.sin(math.pi * nx)
             if win < 0.12:
                 out.append(" ")
                 continue
-            wave_val = math.sin(nx * 10.0 - t * 0.9) * 0.5 + 0.5
-            r_ch = "─" if wave_val > 0.55 else ("╌" if wave_val > 0.25 else "·")
+            col_h = (heights[i * 2] + heights[i * 2 + 1]) * 0.5
+            r_ch = "━" if (has_live and col_h > 0.65) else ("─" if col_h > 0.32 else "·")
             c_phase = phase + 0.15 + nx * 0.55
-            out.append(r_ch, style=pastel_hex(c_phase, brightness=0.28 + 0.26 * env * win))
+            out.append(r_ch, style=pastel_hex(c_phase, brightness=0.28 + 0.45 * col_h * win))
 
         self.update(out)
 
@@ -383,7 +607,7 @@ class TrackItem(ListItem):
             t.append("♫ ", style=f"bold {FG_ROSE}")
             t.append(self.track["name"], style=f"bold {FG_PEACH}")
             t.append(f" · {self.track['artists']}", style=FG_LAVENDER)
-            t.append(f"  [{dur}]", style=FG_SECONDARY)
+            t.append(f" [{dur}]", style=FG_SECONDARY)
         else:
             t.append(f"{self.track_index + 1:>3}. ", style=FG_MUTED)
             t.append(self.track["name"], style=FG_PRIMARY)
@@ -415,9 +639,9 @@ class LyricLine(Static):
 
         t = Text(justify="center")
         if distance == 0:
-            t.append("✦  ", style=FG_PEACH)
+            t.append("✦ ", style=FG_PEACH)
             t.append(self.orig, style="bold #f6dce8")
-            t.append("  ✦", style=FG_PEACH)
+            t.append(" ✦", style=FG_PEACH)
             if self.trans:
                 t.append("\n")
                 t.append(self.trans, style="#c2b6e8")
@@ -460,12 +684,10 @@ class SeekBar(Static):
         phase = anim_t * 0.04
         out = Text(no_wrap=True)
 
-        # 左侧微光渐变已播段
         for i in range(filled):
             c_phase = phase + (i / max(1, width)) * 0.6
             out.append("━", style=pastel_hex(c_phase, brightness=0.95))
 
-        # 呼吸感游标
         if width > 2:
             if playing:
                 pulse_char = "◉" if int(anim_t * 1.5) % 2 == 0 else "◈"
@@ -501,11 +723,15 @@ class NcmTuiApp(App):
         color: #dde2f2;
     }
 
+    .hidden-pane {
+        display: none;
+    }
+
     #top-bar {
         height: 2;
         background: #171a29;
         border-bottom: solid #2a3048;
-        padding: 0 2;
+        padding: 0 1;
         content-align: left middle;
         layout: horizontal;
     }
@@ -523,28 +749,28 @@ class NcmTuiApp(App):
 
     #main-area {
         height: 1fr;
-        padding: 0 1;
+        padding: 0;
     }
 
     #left-pane {
-        width: 26%;
-        min-width: 22;
+        width: 24%;
+        min-width: 20;
         border: round #2c334d;
         background: #161926;
     }
 
     #mid-pane {
-        width: 37%;
-        min-width: 28;
+        width: 1fr;
+        min-width: 26;
         border: round #2c334d;
         background: #151825;
     }
 
     #right-pane {
-        width: 37%;
-        min-width: 30;
+        width: 1fr;
+        min-width: 28;
         border: round #2c334d;
-        padding: 0 1;
+        padding: 0;
         background: #141724;
     }
 
@@ -555,27 +781,24 @@ class NcmTuiApp(App):
     }
 
     .pane-header {
-        height: 2;
+        height: 1;
         background: #1b1f31;
         color: #b4a7e5;
         text-style: bold;
         padding: 0 1;
         content-align: left middle;
-        border-bottom: solid #262c44;
     }
 
     #filter-input {
-        height: 3;
+        height: 1;
         border: none;
-        border-bottom: solid #262c44;
-        background: #181c2c;
+        background: #1b2033;
         color: #dde2f2;
         padding: 0 1;
     }
 
     #filter-input:focus {
-        background: #1d2236;
-        border-bottom: solid #8e83b8;
+        background: #22273e;
     }
 
     ListView {
@@ -600,13 +823,12 @@ class NcmTuiApp(App):
 
     #cover-box {
         height: auto;
-        min-height: 10;
+        min-height: 7;
         align: center middle;
         background: #171a29;
         border: round #2c334d;
-        padding: 0 1;
-        margin-top: 0;
-        margin-bottom: 0;
+        padding: 0;
+        margin: 0 1;
     }
 
     #cover-art {
@@ -619,7 +841,7 @@ class NcmTuiApp(App):
         height: 1;
         text-align: center;
         content-align: center middle;
-        margin-bottom: 0;
+        margin: 0;
     }
 
     #now-title {
@@ -627,38 +849,41 @@ class NcmTuiApp(App):
         color: #f4dce7;
         content-align: center middle;
         text-align: center;
-        margin-top: 0;
+        padding: 0 1;
+        margin: 0;
     }
 
     #now-meta {
         color: #97a1c4;
         text-align: center;
-        margin-bottom: 0;
+        padding: 0 1;
+        margin: 0;
     }
 
     #now-quality {
         color: #8fd8c2;
         text-align: center;
         text-style: bold;
-        margin-bottom: 0;
+        padding: 0 1;
+        margin: 0;
     }
 
     #wave-viz {
         height: 3;
         content-align: center middle;
         text-align: center;
-        margin: 0 0 0 0;
+        margin: 0;
     }
 
     #lyric-scroll {
         height: 1fr;
         border-top: dashed #2b314a;
-        padding: 0 0;
+        padding: 0;
     }
 
     .lyric-line {
         padding: 0 1;
-        margin-bottom: 1;
+        margin-bottom: 0;
         color: #677196;
         text-align: center;
     }
@@ -670,13 +895,14 @@ class NcmTuiApp(App):
     .lyric-active {
         background: #21253b;
         text-style: bold;
+        padding: 0 1;
     }
 
     #player-bar {
-        height: 5;
+        height: 4;
         background: #171a29;
         border-top: solid #2a3048;
-        padding: 0 2;
+        padding: 0 1;
     }
 
     #progress-row {
@@ -685,7 +911,7 @@ class NcmTuiApp(App):
     }
 
     #time-cur, #time-dur {
-        width: 8;
+        width: 7;
         color: #aeb7d6;
         content-align: center middle;
     }
@@ -696,14 +922,15 @@ class NcmTuiApp(App):
     }
 
     #controls-row {
-        height: 3;
+        height: 2;
         align: left middle;
     }
 
     #controls-row Button {
-        min-width: 6;
-        height: 3;
+        min-width: 5;
+        height: 1;
         margin-right: 1;
+        padding: 0 1;
         background: #23283d;
         border: none;
         color: #dce1f2;
@@ -748,6 +975,10 @@ class NcmTuiApp(App):
         Binding("full_stop", "seek_fwd_15", "快进15s", show=False),
         Binding("s", "toggle_shuffle", "随机/顺序"),
         Binding("x", "shuffle_current_playlist", "随机播当前歌单"),
+        Binding("1", "toggle_playlists", "歌单栏"),
+        Binding("2", "toggle_cover", "封面"),
+        Binding("3", "toggle_visualizer", "声波"),
+        Binding("0", "reset_layout", "还原面板"),
         Binding("slash", "focus_filter", "搜索"),
         Binding("escape", "clear_filter", "清除搜索", show=False),
         Binding("minus", "vol_down", "音量-", key_display="-"),
@@ -778,13 +1009,21 @@ class NcmTuiApp(App):
         self.lyric_times: list[float] = []
         self.active_lyric_idx: int = -1
 
+        self.show_playlists: bool = True
+        self.show_cover: bool = True
+        self.show_visualizer: bool = True
+
         self._load_seq: int = 0
         self._consecutive_failures: int = 0
         self._cover_cache: dict[str, str] = {}
         self._cover_status: str = "idle"
+        self._peak_cache: dict[int, PeakTimeline] = {}
+        self._current_peaks: PeakTimeline | None = None
+        self._peak_worker = PeakPrecomputer()
         self._player: MpvPlayer | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tick_timer = None
+        self._tick_count: int = 0
         self._anim_origin: float = time.monotonic()
 
     def compose(self) -> ComposeResult:
@@ -799,7 +1038,7 @@ class NcmTuiApp(App):
 
             with Vertical(id="mid-pane"):
                 yield Static("♫ 歌曲列表", id="track-header", classes="pane-header")
-                yield Input(placeholder="按 / 搜索歌名、歌手、专辑...", id="filter-input")
+                yield Input(placeholder="/ 搜索歌名、歌手、专辑...", id="filter-input")
                 yield ListView(id="track-list")
 
             with Vertical(id="right-pane"):
@@ -807,7 +1046,7 @@ class NcmTuiApp(App):
                     yield VinylCoverStage(id="cover-art")
                 yield Static("", id="cover-aura", markup=False)
                 yield Static("未播放歌曲", id="now-title")
-                yield Static("从左侧选择歌单，按 Enter 或 x 开始播放", id="now-meta")
+                yield Static("左侧选歌单，Enter 或 x 播放", id="now-meta")
                 yield Static(f"✦ 目标音质 · {self.level.upper()}", id="now-quality")
                 yield AmbientWaveVisualizer(id="wave-viz")
                 yield VerticalScroll(id="lyric-scroll")
@@ -822,22 +1061,23 @@ class NcmTuiApp(App):
                 yield Button("▶", id="btn-play")
                 yield Button("⏭", id="btn-next")
                 yield Button("🔀 随机", id="btn-mode")
-                yield Button("↺ -5s", id="btn-back")
-                yield Button("+5s ↻", id="btn-fwd")
+                yield Button("-5s", id="btn-back")
+                yield Button("+5s", id="btn-fwd")
                 yield Static("音量 100% · 待机", id="status-label")
         yield Footer()
 
     async def on_mount(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._player = MpvPlayer(on_track_end=self._on_mpv_track_end)
-        # 约 8.3 FPS 的柔缓动画刷新，低 CPU 占用且画面如丝般顺滑
-        self._tick_timer = self.set_interval(0.12, self._tick_player_ui)
+        # 20 FPS 主循环驱动高实时性 Peak 可视化与进度条，慢动画内部按帧率节流
+        self._tick_timer = self.set_interval(0.05, self._tick_player_ui)
         asyncio.create_task(self._bootstrap())
 
     async def on_unmount(self) -> None:
         if self._tick_timer:
             self._tick_timer.stop()
             self._tick_timer = None
+        self._peak_worker.cancel()
         if self._player:
             self._player.close()
             self._player = None
@@ -916,7 +1156,6 @@ class NcmTuiApp(App):
         if not isinstance(event.item, TrackItem):
             return
         selected = event.item.track
-        # 将当前浏览歌单设为播放队列
         self.play_queue = list(self.viewing_tracks)
         pl_lv = self.query_one("#playlist-list", ListView)
         if pl_lv.highlighted_child and isinstance(pl_lv.highlighted_child, PlaylistItem):
@@ -997,6 +1236,9 @@ class NcmTuiApp(App):
         self.current_index = idx
         self.current_track = track
 
+        self._peak_worker.cancel()
+        self._current_peaks = None
+
         self._cover_status = "loading"
         cover_stage = self.query_one("#cover-art", VinylCoverStage)
         cover_stage.clear_cover(time.monotonic() - self._anim_origin, status="loading")
@@ -1042,7 +1284,19 @@ class NcmTuiApp(App):
         size_mb = round((info.get("size") or 0) / 1048576, 1)
         self.query_one("#now-quality", Static).update(f"✦ {lv} · {fmt} · {br}kbps · {size_mb}MB")
 
-        # 并行加载封面与歌词
+        # 启动流式 Peak 预计算（优先命中内存缓存）
+        tid = int(track["id"])
+        cached_peaks = self._peak_cache.get(tid)
+        if cached_peaks is not None:
+            self._current_peaks = cached_peaks
+        else:
+            timeline = PeakTimeline()
+            if len(self._peak_cache) >= 16:
+                self._peak_cache.pop(next(iter(self._peak_cache)))
+            self._peak_cache[tid] = timeline
+            self._current_peaks = timeline
+            self._peak_worker.start(playable_url, timeline)
+
         asyncio.create_task(self._load_cover_and_lyrics(track, seq))
 
     async def _skip_on_failure(self, track: dict[str, Any]) -> None:
@@ -1065,9 +1319,9 @@ class NcmTuiApp(App):
                 cover_box = self.query_one("#cover-box")
                 right_pane = self.query_one("#right-pane")
                 pane_h = right_pane.size.height or 30
-                max_w = max(20, min(38, (cover_box.size.width or 36) - 6))
-                max_h = max(8, min(15, pane_h // 3))
-                h = max(8, min(max_h, max_w // 2))
+                max_w = max(16, min(32, (cover_box.size.width or 34) - 4))
+                max_h = max(6, min(10, pane_h // 4))
+                h = max(6, min(max_h, max_w // 2))
                 w = min(max_w, h * 2)
                 try:
                     ansi = await asyncio.to_thread(ncm.fetch_cover_ansi, pic_url, w, h)
@@ -1121,7 +1375,6 @@ class NcmTuiApp(App):
                 item.set_playing(item.track["id"] == playing_id)
 
     def _render_cover_aura(self, t: float, playing: bool, paused: bool) -> Text:
-        """封面下方的一行缓慢流动粉彩光带与小黑胶转速指示。"""
         phase = t * 0.045
         disc_frames = ("◐", "◓", "◑", "◒")
         disc = disc_frames[int(t * (2.5 if playing else 0.7)) % 4]
@@ -1159,56 +1412,75 @@ class NcmTuiApp(App):
         except Exception:  # noqa: BLE001
             return
 
-        t = time.monotonic() - self._anim_origin
+        now = time.monotonic()
+        t = now - self._anim_origin
+        self._tick_count += 1
         st = self._player.get_state()
         is_actively_playing = st.playing and not st.paused and not st.buffering
 
         dur = st.duration
         if dur <= 0 and self.current_track:
             dur = (self.current_track.get("duration_ms") or 0) / 1000.0
+
+        # 根据单调时间戳平滑内插播放位置，实现 20 FPS 贴合节拍的零卡顿同步
         pos = st.time_pos
+        if is_actively_playing and st.time_pos_at > 0:
+            delta = max(0.0, min(0.35, now - st.time_pos_at))
+            pos = pos + delta
+            if dur > 0:
+                pos = min(dur, pos)
 
-        # 慢动画组件更新
-        brand.render_frame(t, playing=is_actively_playing)
-        if not cover_stage.has_cover:
-            ascii_state = (
-                "loading"
-                if self._cover_status == "loading"
-                else ("playing" if is_actively_playing else ("error" if self._cover_status == "error" else "idle"))
+        # 高实时性部分：每帧 (20 FPS) 刷新声波可视化与进度条
+        if self.show_visualizer:
+            wave_state = (
+                "buffering"
+                if st.buffering
+                else ("paused" if st.paused else ("playing" if st.playing else "idle"))
             )
-            cover_stage.render_ascii_frame(t, status=ascii_state)
-        cover_aura.update(self._render_cover_aura(t, playing=st.playing, paused=st.paused))
+            wave_viz.render_wave(t, state=wave_state, pos=pos, timeline=self._current_peaks)
 
-        wave_state = (
-            "buffering"
-            if st.buffering
-            else ("paused" if st.paused else ("playing" if st.playing else "idle"))
-        )
-        wave_viz.render_wave(t, state=wave_state)
-
+        seek_bar.update_progress(pos, dur, anim_t=t, playing=is_actively_playing)
         time_cur.update(fmt_time(pos))
         time_dur.update(fmt_time(dur))
-        seek_bar.update_progress(pos, dur, anim_t=t, playing=is_actively_playing)
 
-        play_btn.label = "▶" if (st.paused or not st.playing) else "⏸"
+        # 慢动画与状态装饰：每 3 帧 (~6.7 FPS) 刷新一次，节省 CPU
+        if self._tick_count % 3 == 0:
+            brand.render_frame(t, playing=is_actively_playing)
+            if self.show_cover:
+                if not cover_stage.has_cover:
+                    ascii_state = (
+                        "loading"
+                        if self._cover_status == "loading"
+                        else (
+                            "playing"
+                            if is_actively_playing
+                            else ("error" if self._cover_status == "error" else "idle")
+                        )
+                    )
+                    cover_stage.render_ascii_frame(t, status=ascii_state)
+                cover_aura.update(self._render_cover_aura(t, playing=st.playing, paused=st.paused))
 
-        # 底部状态条微动画
-        eq_frames = ("▁▂▄▃", "▂▄▆▄", "▃▆▄▂", "▄▃▂▄")
-        spin_frames = ("◐", "◓", "◑", "◒")
-        status_text = Text(no_wrap=True)
-        status_text.append(f"音量 {int(st.volume)}% · ", style=FG_SECONDARY)
-        if st.buffering:
-            sp = spin_frames[int(t * 4) % 4]
-            status_text.append(f"{sp} 缓冲中...", style=FG_CREAM)
-        elif st.paused:
-            status_text.append("⏸ 已暂停", style=FG_PEACH)
-        elif st.playing:
-            eq = eq_frames[int(t * 3.0) % 4]
-            status_text.append(f"{eq} ", style=pastel_hex(t * 0.05, brightness=1.0))
-            status_text.append("播放中", style=FG_MINT)
-        else:
-            status_text.append("✧ 待机", style=FG_MUTED)
-        status_lbl.update(status_text)
+            play_btn.label = "▶" if (st.paused or not st.playing) else "⏸"
+
+            eq_frames = ("▁▂▄▃", "▂▄▆▄", "▃▆▄▂", "▄▃▂▄")
+            spin_frames = ("◐", "◓", "◑", "◒")
+            status_text = Text(no_wrap=True)
+            status_text.append(f"音量 {int(st.volume)}% · ", style=FG_SECONDARY)
+            if st.buffering:
+                sp = spin_frames[int(t * 4) % 4]
+                status_text.append(f"{sp} 缓冲中...", style=FG_CREAM)
+            elif st.paused:
+                status_text.append("⏸ 已暂停", style=FG_PEACH)
+            elif st.playing:
+                eq = eq_frames[int(t * 3.0) % 4]
+                status_text.append(f"{eq} ", style=pastel_hex(t * 0.05, brightness=1.0))
+                if self._current_peaks and self._current_peaks.done:
+                    status_text.append("播放中·Peak就绪", style=FG_MINT)
+                else:
+                    status_text.append("播放中", style=FG_MINT)
+            else:
+                status_text.append("✧ 待机", style=FG_MUTED)
+            status_lbl.update(status_text)
 
         # 歌词丝滑滚动 + 景深渐变高亮
         if self.lyric_times and st.playing:
@@ -1221,7 +1493,6 @@ class NcmTuiApp(App):
                     lines[prev_idx].remove_class("lyric-active")
                 self.active_lyric_idx = idx
 
-                # 只更新新旧锚点邻近几行的景深颜色，保持零卡顿
                 touched: set[int] = set()
                 for anchor in (prev_idx, idx):
                     if anchor >= 0:
@@ -1243,6 +1514,34 @@ class NcmTuiApp(App):
                         force=True,
                     )
 
+    # ── 面板开关与布局控制 ───────────────────────────────────────────────────
+    def _apply_panel_visibility(self) -> None:
+        self.query_one("#left-pane").set_class(not self.show_playlists, "hidden-pane")
+        self.query_one("#cover-box").set_class(not self.show_cover, "hidden-pane")
+        self.query_one("#cover-aura").set_class(not self.show_cover, "hidden-pane")
+        self.query_one("#wave-viz").set_class(not self.show_visualizer, "hidden-pane")
+
+    def action_toggle_playlists(self) -> None:
+        self.show_playlists = not self.show_playlists
+        self._apply_panel_visibility()
+        if not self.show_playlists:
+            self.query_one("#track-list", ListView).focus()
+
+    def action_toggle_cover(self) -> None:
+        self.show_cover = not self.show_cover
+        self._apply_panel_visibility()
+
+    def action_toggle_visualizer(self) -> None:
+        self.show_visualizer = not self.show_visualizer
+        self._apply_panel_visibility()
+
+    def action_reset_layout(self) -> None:
+        self.show_playlists = True
+        self.show_cover = True
+        self.show_visualizer = True
+        self._apply_panel_visibility()
+
+    # ── 播放控制快捷键 ───────────────────────────────────────────────────────
     def seek_to(self, seconds: float) -> None:
         if self._player:
             self._player.seek_to(seconds)
@@ -1327,6 +1626,7 @@ class NcmTuiApp(App):
         if self._tick_timer:
             self._tick_timer.stop()
             self._tick_timer = None
+        self._peak_worker.cancel()
         if self._player:
             self._player.close()
             self._player = None
