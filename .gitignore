@@ -1,0 +1,6 @@
+cookie.txt
+output/
+.venv/
+__pycache__/
+*.pyc
+.dsh/
