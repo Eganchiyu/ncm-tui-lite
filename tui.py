@@ -311,8 +311,9 @@ class NcmTuiApp(App):
         Binding("x", "shuffle_current_playlist", "随机播当前歌单"),
         Binding("slash", "focus_filter", "搜索"),
         Binding("escape", "clear_filter", "清除搜索", show=False),
-        Binding("minus", "vol_down", "音量-"),
-        Binding("equal", "vol_up", "音量+"),
+        Binding("minus", "vol_down", "音量-", key_display="-"),
+        Binding("equals_sign", "vol_up", "音量+", key_display="="),
+        Binding("plus", "vol_up", "音量+", show=False),
         Binding("r", "reload_playlists", "刷新歌单"),
         Binding("q", "quit_app", "退出"),
     ]

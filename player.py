@@ -202,7 +202,7 @@ class MpvPlayer:
         self._command(["seek", max(0.0, seconds), "absolute"])
 
     def set_volume(self, vol: float) -> float:
-        clamped = max(0.0, min(130.0, vol))
+        clamped = max(0.0, min(100.0, vol))
         self._command(["set_property", "volume", clamped])
         return clamped
 
