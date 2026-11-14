@@ -13,4 +13,5 @@
 
 ## 2026-11-14
 - 重写 `README.md`：移除本机路径与本机预置环境假设，补充面向新用户的仓库克隆（`https://github.com/Eganchiyu/ncm-tui-lite`）、虚拟环境创建、Python/系统依赖安装、启动命令、最新 TUI 快捷键（含 `v` 切换 FFT 频谱/波形与 `1/2/3/0` 面板开关）及各平台兼容性说明。
+- 新增 `LICENSE`（MIT License，版权署名 `Eganchiyu`），并在 `README.md` 末尾补充开源协议与版权/使用范围免责声明。
 
