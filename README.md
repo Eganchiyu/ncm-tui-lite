@@ -1,6 +1,6 @@
 # ncm-tui-lite
 
-基于本人账号 Cookie 直连网易云音乐 Web / EAPI 接口的轻量级 CLI 下载器与 TUI 无损流媒体播放器（最高支持 **lossless / SQ, FLAC**，不涉及 Hi-Res / 沉浸环绕等更高档位）。
+基于本人账号 Cookie 直连网易云音乐 Web / EAPI 接口的轻量级 CLI 下载器与 TUI 无损流媒体播放器（最高支持 **lossless / SQ, FLAC**，不涉及 Hi-Res / 沉浸环绕等更高档位）。这是因为本作者是无损派，主要用监听耳机来听歌，不是很喜欢经过AI调音的音质选项，于是锁定在无损位置。如果需要更高的音质选项，可以通过修改代码来轻松修改。
 
 仓库地址：<https://github.com/Eganchiyu/ncm-tui-lite>
 
