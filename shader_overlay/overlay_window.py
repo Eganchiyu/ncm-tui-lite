@@ -30,6 +30,8 @@ from .shaders import (
     GL_LINEAR_MIPMAP_LINEAR,
     GL_ONE,
     GL_ONE_MINUS_SRC_ALPHA,
+    GL_R8,
+    GL_RED,
     GL_RGBA8,
     GL_STREAM_DRAW,
     GL_TEXTURE0,
@@ -40,6 +42,7 @@ from .shaders import (
     GL_TEXTURE_WRAP_S,
     GL_TEXTURE_WRAP_T,
     GL_TRIANGLES,
+    GL_UNPACK_ALIGNMENT,
     GL_UNSIGNED_BYTE,
     LYRIC_FRAG_SHADER,
     LYRIC_VERT_SHADER,
@@ -226,6 +229,8 @@ def _run_gui(
             self._uniforms: dict[str, int] = {}
             self._lyric_uniforms: dict[str, int] = {}
             self._tick_id: int = 0
+            self._wakeup_timer_id: int = 0
+            self._silent_frames: int = 0
 
             self._clock = SyncedClock()
             self._lookahead = LookaheadPeakTimeline()
@@ -357,6 +362,8 @@ def _run_gui(
             _save_config({"big_lyrics": self._big_lyrics_enabled})
             if self._big_lyrics_enabled and not self._active:
                 self._start_intro()
+            elif self._active:
+                self._ensure_tick_active()
 
         def toggle_big_lyrics(self) -> None:
             self.set_big_lyrics(not self._big_lyrics_enabled)
@@ -365,9 +372,13 @@ def _run_gui(
             mtype = msg.get("type")
             if mtype == "track":
                 self._lyrics_renderer.apply_track(msg)
+                if self._active:
+                    self._ensure_tick_active()
                 return
             if mtype == "state":
                 self._clock.update_from_state(msg)
+                if self._active and self._clock.is_running():
+                    self._ensure_tick_active()
                 return
             if mtype == "peaks":
                 self._lookahead.apply_ipc(msg)
@@ -391,14 +402,46 @@ def _run_gui(
                 Gtk.main_quit()
 
         def _ensure_tick_active(self) -> None:
+            self._silent_frames = 0
+            if self._wakeup_timer_id:
+                GLib.source_remove(self._wakeup_timer_id)
+                self._wakeup_timer_id = 0
             if self._tick_id:
                 return
+            self._last_frame_mono = time.monotonic()
             self._tick_id = self._gl_area.add_tick_callback(self._on_tick)
 
         def _stop_tick(self) -> None:
             if self._tick_id:
                 self._gl_area.remove_tick_callback(self._tick_id)
                 self._tick_id = 0
+
+        def _stop_wakeup_timer(self) -> None:
+            if self._wakeup_timer_id:
+                GLib.source_remove(self._wakeup_timer_id)
+                self._wakeup_timer_id = 0
+
+        def _poll_audio_wakeup(self) -> bool:
+            """独立 PipeWire 监听模式下低频检测系统出声以恢复 VSync 渲染。"""
+            if not self._active or self._tick_id:
+                self._wakeup_timer_id = 0
+                return False
+            now = time.monotonic()
+            if self._clock.is_running() or (now - self._audio._last_audio_at) < 0.85:
+                self._wakeup_timer_id = 0
+                self._ensure_tick_active()
+                return False
+            return True
+
+        def _release_lyric_resources(self) -> None:
+            """释放大歌词 Cairo CPU 表面与 OpenGL 图集显存。"""
+            self._lyrics_renderer.release_resources()
+            if self._gl and self._lyric_tex:
+                self._gl_area.make_current()
+                t = ctypes.c_uint(self._lyric_tex)
+                self._gl.glDeleteTextures(1, ctypes.byref(t))
+                self._lyric_tex = 0
+                self._lyric_tex_init = False
 
         def _on_tick(self, _widget: Any, _frame_clock: Any) -> bool:
             now = time.monotonic()
@@ -445,9 +488,16 @@ def _run_gui(
                     self._intro_active = 0.0
                     self._grabber.set_enabled(False)
                     self._audio.set_capture_enabled(False)
+                    self._stop_wakeup_timer()
+                    self._release_lyric_resources()
                     self.hide()
                     self._stop_tick()
                     return False
+
+            if not self._big_lyrics_enabled and self._lyric_alpha == 0.0 and (
+                self._lyric_tex or self._lyrics_renderer.atlas.surface is not None
+            ):
+                self._release_lyric_resources()
 
             need_grab = (
                 (self._intro_phase in ("in", "out"))
@@ -457,6 +507,24 @@ def _run_gui(
             )
             self._grabber.set_enabled(need_grab)
 
+            is_silent_hold = (
+                self._intro_phase == "hold"
+                and not self._clock.is_running()
+                and self._audio.presence < 0.002
+                and self._lyric_alpha == 0.0
+                and not (self._big_lyrics_enabled and self._lyrics_renderer.has_content)
+            )
+            if is_silent_hold:
+                self._silent_frames += 1
+                self._gl_area.queue_render()
+                if self._silent_frames >= 2:
+                    self._tick_id = 0
+                    if need_rt_capture and not self._wakeup_timer_id:
+                        self._wakeup_timer_id = GLib.timeout_add(80, self._poll_audio_wakeup)
+                    return False
+                return True
+
+            self._silent_frames = 0
             self._gl_area.queue_render()
             return True
 
@@ -494,17 +562,12 @@ def _run_gui(
                 gl.glBindBuffer(GL_ARRAY_BUFFER, 0)
                 gl.glBindVertexArray(0)
 
-                texs = (ctypes.c_uint * 2)()
-                gl.glGenTextures(2, texs)
-                # 屏幕抓取纹理
-                gl.glBindTexture(GL_TEXTURE_2D, texs[0])
+                gl.glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+                tex = ctypes.c_uint(0)
+                gl.glGenTextures(1, ctypes.byref(tex))
+                # 屏幕抓取纹理（大歌词单通道 GL_R8 图集按需延迟创建）
+                gl.glBindTexture(GL_TEXTURE_2D, tex.value)
                 gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-                # 巨型动态歌词字形图集（开启硬件 Mipmap 三线性滤波，支持电影拉焦与丝滑光晕）
-                gl.glBindTexture(GL_TEXTURE_2D, texs[1])
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
                 gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
                 gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
                 gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
@@ -516,8 +579,8 @@ def _run_gui(
                 self._lyric_prog = lyric_prog
                 self._lyric_vao = vaos[1]
                 self._lyric_vbo = vbo.value
-                self._tex = texs[0]
-                self._lyric_tex = texs[1]
+                self._tex = tex.value
+                self._lyric_tex = 0
                 self._lyric_tex_init = False
                 self._bands_buf = (ctypes.c_float * 8)()
                 for uname in (
@@ -548,9 +611,6 @@ def _run_gui(
                     "u_intro",
                     "u_intro_active",
                     "u_seed",
-                    "u_lyric_tex",
-                    "u_lyric_alpha",
-                    "u_lyric_rect",
                 ):
                     self._uniforms[uname] = gl.glGetUniformLocation(prog, uname.encode("ascii"))
 
@@ -619,17 +679,18 @@ def _run_gui(
 
             frame = self._grabber.consume_frame()
             if frame is not None and self._tex:
-                fw, fh, fbytes = frame
+                fw, fh, fbuf = frame
+                fptr = ctypes.byref(fbuf)
                 gl.glActiveTexture(GL_TEXTURE0)
                 gl.glBindTexture(GL_TEXTURE_2D, self._tex)
                 if fw != self._tex_w or fh != self._tex_h:
                     gl.glTexImage2D(
-                        GL_TEXTURE_2D, 0, GL_RGBA8, fw, fh, 0, GL_BGRA, GL_UNSIGNED_BYTE, fbytes
+                        GL_TEXTURE_2D, 0, GL_RGBA8, fw, fh, 0, GL_BGRA, GL_UNSIGNED_BYTE, fptr
                     )
                     self._tex_w, self._tex_h = fw, fh
                 else:
                     gl.glTexSubImage2D(
-                        GL_TEXTURE_2D, 0, 0, 0, fw, fh, GL_BGRA, GL_UNSIGNED_BYTE, fbytes
+                        GL_TEXTURE_2D, 0, 0, 0, fw, fh, GL_BGRA, GL_UNSIGNED_BYTE, fptr
                     )
                 self._has_screen = True
 
@@ -639,25 +700,55 @@ def _run_gui(
 
             lyric_vbuf = None
             lyric_vcount = 0
-            if (self._big_lyrics_enabled or self._lyric_alpha > 0.002) and self._lyric_tex:
+            if self._big_lyrics_enabled or self._lyric_alpha > 0.002:
                 pos = self._clock.position(now)
                 upload, lyric_vbuf, lyric_vcount = self._lyrics_renderer.update(
                     pos, self._clock.is_running(), render_dt, now, w, h, self._audio
                 )
                 if upload is not None:
-                    is_full, uy0, uh, ubytes = upload
+                    is_full, uy0, uh, uptr, _keepalive = upload
                     aw = self._lyrics_renderer.atlas.ATLAS_W
                     ah = self._lyrics_renderer.atlas.ATLAS_H
-                    gl.glActiveTexture(GL_TEXTURE1)
-                    gl.glBindTexture(GL_TEXTURE_2D, self._lyric_tex)
+                    if not self._lyric_tex:
+                        lt = ctypes.c_uint(0)
+                        gl.glGenTextures(1, ctypes.byref(lt))
+                        self._lyric_tex = lt.value
+                        self._lyric_tex_init = False
+                        gl.glActiveTexture(GL_TEXTURE1)
+                        gl.glBindTexture(GL_TEXTURE_2D, self._lyric_tex)
+                        gl.glTexParameteri(
+                            GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR
+                        )
+                        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                    else:
+                        gl.glActiveTexture(GL_TEXTURE1)
+                        gl.glBindTexture(GL_TEXTURE_2D, self._lyric_tex)
                     if not self._lyric_tex_init or is_full:
                         gl.glTexImage2D(
-                            GL_TEXTURE_2D, 0, GL_RGBA8, aw, ah, 0, GL_BGRA, GL_UNSIGNED_BYTE, ubytes
+                            GL_TEXTURE_2D,
+                            0,
+                            GL_R8,
+                            aw,
+                            ah,
+                            0,
+                            GL_RED,
+                            GL_UNSIGNED_BYTE,
+                            ctypes.c_void_p(uptr),
                         )
                         self._lyric_tex_init = True
                     else:
                         gl.glTexSubImage2D(
-                            GL_TEXTURE_2D, 0, 0, uy0, aw, uh, GL_BGRA, GL_UNSIGNED_BYTE, ubytes
+                            GL_TEXTURE_2D,
+                            0,
+                            0,
+                            uy0,
+                            aw,
+                            uh,
+                            GL_RED,
+                            GL_UNSIGNED_BYTE,
+                            ctypes.c_void_p(uptr),
                         )
                     gl.glGenerateMipmap(GL_TEXTURE_2D)
 
@@ -666,7 +757,7 @@ def _run_gui(
             gl.glClear(GL_COLOR_BUFFER_BIT)
             gl.glDisable(GL_BLEND)
 
-            # ── Pass 1: 现有全屏流质 Shader（100% 保持原汁原味） ───────────────
+            # ── Pass 1: 现有全屏流质 Shader（边缘折射 + 屏幕中央 Early-Out） ──
             gl.glUseProgram(self._prog)
             u = self._uniforms
             a = self._audio
@@ -675,12 +766,6 @@ def _run_gui(
             gl.glBindTexture(GL_TEXTURE_2D, self._tex)
             gl.glUniform1i(u["u_screen"], 0)
             gl.glUniform1f(u["u_has_screen"], 1.0 if self._has_screen else 0.0)
-
-            gl.glActiveTexture(GL_TEXTURE1)
-            gl.glBindTexture(GL_TEXTURE_2D, self._lyric_tex)
-            gl.glUniform1i(u["u_lyric_tex"], 1)
-            gl.glUniform1f(u["u_lyric_alpha"], 0.0)
-            gl.glUniform4f(u["u_lyric_rect"], 0.0, 0.0, 1.0, 1.0)
 
             gl.glUniform2f(u["u_res"], float(w), float(h))
             gl.glUniform1f(u["u_time"], float(now - self._start_mono))
@@ -778,6 +863,7 @@ def _run_gui(
 
         def _on_destroy(self, _w: Any) -> None:
             self._stop_tick()
+            self._stop_wakeup_timer()
             self._hotkey.stop()
             self._grabber.stop()
             self._audio.stop()

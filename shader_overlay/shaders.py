@@ -26,6 +26,9 @@ GL_TEXTURE_WRAP_T = 0x2803
 GL_LINEAR = 0x2601
 GL_LINEAR_MIPMAP_LINEAR = 0x2703
 GL_CLAMP_TO_EDGE = 0x812F
+GL_UNPACK_ALIGNMENT = 0x0CF5
+GL_RED = 0x1903
+GL_R8 = 0x8229
 GL_RGBA8 = 0x8058
 GL_BGRA = 0x80E1
 GL_UNSIGNED_BYTE = 0x1401
@@ -79,9 +82,6 @@ uniform float u_bands[8];       // 8 频段平滑频谱（低 -> 高）
 uniform float u_intro;          // 0..1: 左下 -> 右上液态玻璃入场扫描进度
 uniform float u_intro_active;   // 0..1: 入场/退场波前可见度
 uniform float u_seed;           // 随机种子
-uniform sampler2D u_lyric_tex;  // 可选全屏大歌词离屏纹理 (Premultiplied Alpha)
-uniform float u_lyric_alpha;    // 0..1: 大歌词显示平滑权重
-uniform vec4  u_lyric_rect;     // (x0, y0, x1, y1) 大歌词在 UV 中的矩形区域
 
 // ── 流动全光谱光影调色板（青绿 -> 冰蓝 -> 靛紫 -> 珊瑚金 -> 柔粉流动循环，不固定粉色）
 vec3 flowingAuroraColor(float t, float warmth) {
@@ -207,10 +207,14 @@ vec2 toScreenTexUV(vec2 uv) {
 }
 
 void main() {
+    if (u_presence <= 0.02 && u_intro_active <= 0.002) {
+        fragColor = vec4(0.0);
+        return;
+    }
+
     vec2 uv = v_uv;
     float aspect = u_res.x / max(1.0, u_res.y);
     vec2 aspectVec = vec2(aspect, 1.0);
-    vec2 p = (uv - 0.5) * aspectVec * 1.16;
 
     // ── 1. 超低频（808）与底鼓（Kick）完全解耦的音乐包络 ──────────────────────
     float beatCurve = u_beat * u_beat * (3.0 - 2.0 * u_beat);
@@ -225,14 +229,44 @@ void main() {
     float dynamicBeat = (beatCurve * 0.40 + heavyCurve * 0.60 + kickCurve * 0.88) * u_beat_rand;
     float tension = clamp(dynamicBeat * 0.72, 0.0, 1.45);
 
-    // ── 2. 屏幕边缘距离场 & 环绕频谱映射 ──────────────────────────────────────
+    // ── 2. 屏幕边缘距离场 & 环绕频谱映射 + 屏幕中央透明死区 Early-Out ─────────
     vec2 pxDist = min(uv, 1.0 - uv) * u_res;
     float edgePx = min(pxDist.x, pxDist.y);
+    float diag = (uv.x + uv.y) * 0.5;
+    float baseWaveFront = mix(-0.18, 1.18, u_intro);
+    bool inWaveBand = (u_intro_active > 0.002) && (abs(diag - baseWaveFront + 0.03) < 0.28);
 
     float horizSym = abs(uv.x - 0.5) * 2.0;
     float perimSpecCoord = clamp(uv.y * 0.78 + (1.0 - horizSym) * 0.22, 0.0, 1.0);
     float localBand = sampleBand(perimSpecCoord);
     float localBandCurve = localBand * localBand * (3.0 - 2.0 * localBand);
+
+    if (!inWaveBand) {
+        if (audioPresence <= 0.001 || diag > baseWaveFront + 0.16) {
+            fragColor = vec4(0.0);
+            return;
+        }
+        // 精确计算当帧边缘光效与扭曲的最大可见像素半径（超出处 alpha < 1/512 严格为 0）
+        float maxKickImp = kickCurve * u_beat_rand * 1.54;
+        float baseWarp = audioPresence * (0.0016 * u_energy + 0.0042 * beatCurve + 0.0128 * maxKickImp);
+        float innerFloorAct = baseWarp * 0.04 * 1.35 * 1.85
+                            + audioPresence * (heavyCurve * 0.42 + maxKickImp * 0.86) * 0.0024 * 0.85;
+        if (innerFloorAct < 0.00033) {
+            float limRim = 14.0 + 2.55 * (22.0 + 60.0 * (0.45 + 0.65 * highCurve + 0.45 * localBandCurve + 0.35 * heavyCurve));
+            float limSub = (74.0 + 62.0 * subCurve) * 2.20;
+            float limPart = (highCurve >= 0.03) ? (6.0 + 2.95 * (95.0 + 55.0 * highCurve)) : 0.0;
+            float limWarp = (baseWarp > 0.00015)
+                ? (28.0 + 2.35 * (204.0 + 68.0 * localBandCurve + 119.0 * tension))
+                : 0.0;
+            float maxActivePx = max(max(limRim, limSub), max(limPart, limWarp));
+            if (edgePx > maxActivePx) {
+                fragColor = vec4(0.0);
+                return;
+            }
+        }
+    }
+
+    vec2 p = (uv - 0.5) * aspectVec * 1.16;
 
     // ── 3. 单层干净粘稠流场（无多余叠层） ─────────────────────────────────────
     float fVal = 0.0;
@@ -240,9 +274,8 @@ void main() {
     pigmentField(p + vec2(u_seed * 2.3, -u_seed * 1.9), u_flow_time, u_flow_vel, tension, fVal, fGrad);
 
     // ── 4. 左下 -> 右上 液态玻璃入场/退场波前 ─────────────────────────────────
-    float diag = (uv.x + uv.y) * 0.5;
     float waveWobble = 0.026 * sin(uv.x * 6.5 - uv.y * 5.5 + u_time * 2.2) + 0.036 * fVal;
-    float waveFront = mix(-0.18, 1.18, u_intro) + waveWobble;
+    float waveFront = baseWaveFront + waveWobble;
     float dWave = diag - waveFront;
 
     float waveMain = exp(-pow(dWave / 0.055, 2.0));
@@ -380,36 +413,6 @@ void main() {
     }
 
     vec4 premulFluid = vec4(clamp(outCol, 0.0, 1.0) * finalAlpha, finalAlpha);
-
-    // ── 10. 可开关全屏大歌词层 ────────────────────────────────────────────────
-    if (u_lyric_alpha > 0.003) {
-        vec2 rectMin = u_lyric_rect.xy;
-        vec2 rectMax = u_lyric_rect.zw;
-        vec2 rectSize = max(vec2(1e-4), rectMax - rectMin);
-        vec2 luv = (uv - rectMin) / rectSize;
-
-        // 超低频驱动沉稳呼吸缩放，底鼓驱动干脆微弹跳
-        float breathScale = 1.0 + (0.013 * kickCurve * u_beat_rand + 0.008 * subBreath) * audioPresence;
-        vec2 suv = (luv - 0.5) / breathScale + 0.5;
-
-        if (suv.x > 0.0 && suv.x < 1.0 && suv.y > 0.0 && suv.y < 1.0) {
-            vec2 texUv = vec2(suv.x, 1.0 - suv.y);
-            float lCa = (kickCurve * 0.0018 + u_sparkle * 0.0009) * audioPresence;
-            vec4 lSample;
-            if (lCa > 0.0003) {
-                vec4 lR = texture(u_lyric_tex, clamp(texUv + vec2(lCa, 0.0), vec2(0.001), vec2(0.999)));
-                vec4 lG = texture(u_lyric_tex, texUv);
-                vec4 lB = texture(u_lyric_tex, clamp(texUv - vec2(lCa, 0.0), vec2(0.001), vec2(0.999)));
-                float la = max(lG.a, max(lR.a, lB.a) * 0.85);
-                lSample = vec4(lR.r, lG.g, lB.b, la);
-            } else {
-                lSample = texture(u_lyric_tex, texUv);
-            }
-            lSample *= u_lyric_alpha * sweepReveal;
-            premulFluid = lSample + premulFluid * (1.0 - lSample.a);
-        }
-    }
-
     fragColor = clamp(premulFluid, 0.0, 1.0);
 }
 """
@@ -492,7 +495,7 @@ float gnoise(vec2 p) {
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
-// 严格钳位在字形单元格内部的 Mipmap 采样，杜绝跨格串色
+// 严格钳位在字形单元格内部的 Mipmap 单通道采样（GL_R8），杜绝跨格串色
 float sampleGlyph(vec2 uv, float lod) {
     vec2 pad = (0.65 + lod * 0.55) / max(vec2(64.0), u_atlas_size);
     vec2 lo = v_cell_uv.xy + pad;
@@ -500,7 +503,7 @@ float sampleGlyph(vec2 uv, float lod) {
     if (uv.x < v_cell_uv.x || uv.x > v_cell_uv.z || uv.y < v_cell_uv.y || uv.y > v_cell_uv.w) {
         return 0.0;
     }
-    return textureLod(u_atlas, clamp(uv, lo, hi), lod).a;
+    return textureLod(u_atlas, clamp(uv, lo, hi), lod).r;
 }
 
 vec2 toScreenTexUV(vec2 uv) {
@@ -533,10 +536,22 @@ void main() {
 
     vec2 cellSize = max(vec2(1e-4), v_cell_uv.zw - v_cell_uv.xy);
     vec2 texel = 1.0 / max(vec2(64.0), u_atlas_size);
+    vec2 shadowOff = vec2(texel.x * 2.2, -texel.y * 4.5);
+
+    // 正常展示期先用粗 Mipmap 探针剔除字形 Quad 四角纯空白像素，省去 2 次 gnoise
+    if (dissolve < 0.05 && ignite < 0.08) {
+        float preHalo = sampleGlyph(v_uv, 3.35);
+        if (preHalo < 0.0025 && sampleGlyph(v_uv - shadowOff, 3.35) < 0.0025) {
+            discard;
+        }
+    }
 
     // 退场/入场时的有机流体烟雾扰动
     float n1 = gnoise(localUv * 3.8 + vec2(seed * 5.3 + u_flow_time * 0.35, -u_flow_time * 0.28));
-    float n2 = gnoise(localUv * 7.6 + vec2(-seed * 3.1 - u_time * 0.45, seed * 2.7 + u_time * 0.32));
+    float n2 = 0.0;
+    if (dissolve > 0.001 || ignite > 0.01) {
+        n2 = gnoise(localUv * 7.6 + vec2(-seed * 3.1 - u_time * 0.45, seed * 2.7 + u_time * 0.32));
+    }
     vec2 fluidWarp = vec2(n1, n2) * cellSize * (0.048 * dissolve * dissolve + 0.0045 * ignite);
     vec2 suv = v_uv + fluidWarp;
 
@@ -548,7 +563,6 @@ void main() {
     float wideHalo = sampleGlyph(suv, 3.35);
 
     // 轻柔下偏移光学投影（托底防亮色桌面吞字）
-    vec2 shadowOff = vec2(texel.x * 2.2, -texel.y * 4.5);
     float shadowA = sampleGlyph(suv - shadowOff, clamp(coreLod + 2.1, 1.8, 3.6));
 
     // 流体溶解侵蚀
@@ -597,14 +611,8 @@ void main() {
     float kickCurve = u_beat_kick * u_beat_kick * (3.0 - 2.0 * u_beat_kick);
     float subCurve = u_sub * u_sub * (3.0 - 2.0 * u_sub);
 
-    // 估算字形平滑法线（供玻璃折射与菲涅尔刀锋边缘高光）
-    float nStep = max(2.2, 3.0 + coreLod * 1.4);
-    vec2 gDx = vec2(texel.x * nStep, 0.0);
-    vec2 gDy = vec2(0.0, texel.y * nStep);
-    float nLod = clamp(coreLod + 1.05, 0.9, 2.8);
-    float gx = sampleGlyph(suv + gDx, nLod) - sampleGlyph(suv - gDx, nLod);
-    float gy = sampleGlyph(suv + gDy, nLod) - sampleGlyph(suv - gDy, nLod);
-    vec2 glyphGrad = vec2(gx, gy);
+    // 利用 GPU 硬件偏导从平滑场 nearGlow 直接求屏幕空间法线（省去 4 次邻域纹理采样）
+    vec2 glyphGrad = vec2(dFdx(nearGlow), -dFdy(nearGlow));
     float gradMag = length(glyphGrad);
     vec2 glyphNormal = (gradMag > 1e-4) ? (glyphGrad / gradMag) : vec2(0.0, 1.0);
 
@@ -640,7 +648,7 @@ void main() {
     // 菲涅尔刀锋边缘高光（受光面流光随时间缓缓转动）
     float lightAng = u_time * 0.38 + seed * 4.1;
     vec2 lightDir = vec2(cos(lightAng), sin(lightAng));
-    float edgeBand = clamp(gradMag * 2.55, 0.0, 1.0) * smoothstep(0.04, 0.65, coreA);
+    float edgeBand = clamp(gradMag * 12.0, 0.0, 1.0) * smoothstep(0.04, 0.65, coreA);
     float fresnelSpec = pow(edgeBand, 1.25) * (0.42 + 0.58 * max(0.0, dot(glyphNormal, lightDir)));
 
     // ── 待唱态（液态冰晶磨砂玻璃：轻盈、空灵、透底） ─────────────────────────
@@ -827,6 +835,7 @@ class _GLBindings:
         )
         self.glActiveTexture = self._bind("glActiveTexture", None, [ctypes.c_uint])
         self.glBindTexture = self._bind("glBindTexture", None, [ctypes.c_uint, ctypes.c_uint])
+        self.glPixelStorei = self._bind("glPixelStorei", None, [ctypes.c_uint, ctypes.c_int])
         self.glTexParameteri = self._bind("glTexParameteri", None, [ctypes.c_uint, ctypes.c_uint, ctypes.c_int])
         self.glGenerateMipmap = self._bind("glGenerateMipmap", None, [ctypes.c_uint])
         self.glTexImage2D = self._bind(

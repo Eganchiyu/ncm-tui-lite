@@ -65,6 +65,10 @@ class _XImage(ctypes.Structure):
     ]
 
 
+class _XTransform(ctypes.Structure):
+    _fields_ = [("matrix", (ctypes.c_int * 3) * 3)]
+
+
 class X11ScreenGrabber:
     """基于 XComposite + XRender + MIT-SHM 的无反馈底层屏幕实时采集器（自动排除自身叠加窗口）。"""
 
@@ -76,6 +80,7 @@ class X11ScreenGrabber:
     IPC_PRIVATE = 0
     IPC_CREAT = 0o1000
     IPC_RMID = 0
+    CAPTURE_DIV = 2  # 1/2 分辨率硬件缩放采集（降低 75% SHM/内存带宽/纹理上传开销）
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -89,7 +94,10 @@ class X11ScreenGrabber:
         self._width: int = 0
         self._height: int = 0
 
-        self._frame_buf: bytes | None = None
+        self._cap_w: int = 0
+        self._cap_h: int = 0
+        self._front_buf: Any = None
+        self._back_buf: Any = None
         self._frame_seq: int = 0
         self._uploaded_seq: int = 0
         self._err_cb: Any = None
@@ -119,13 +127,13 @@ class X11ScreenGrabber:
         self._stop.set()
         self._active_event.set()
 
-    def consume_frame(self) -> tuple[int, int, bytes] | None:
-        """若存在新帧则取出 (width, height, bgra_bytes)，否则返回 None。"""
+    def consume_frame(self) -> tuple[int, int, Any] | None:
+        """若存在新帧则取出 (width, height, ctypes_bgra_buf)，零堆分配。"""
         with self._lock:
-            if self._frame_buf is None or self._frame_seq == self._uploaded_seq:
+            if self._front_buf is None or self._frame_seq == self._uploaded_seq:
                 return None
             self._uploaded_seq = self._frame_seq
-            return self._width, self._height, self._frame_buf
+            return self._cap_w, self._cap_h, self._front_buf
 
     def _run(self) -> None:
         try:
@@ -208,6 +216,18 @@ class X11ScreenGrabber:
             ctypes.c_int,
             ctypes.c_uint,
             ctypes.c_uint,
+        ]
+        xrender.XRenderSetPictureTransform.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(_XTransform),
+        ]
+        xrender.XRenderSetPictureFilter.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
         ]
 
         xext.XShmCreateImage.argtypes = [
@@ -304,6 +324,10 @@ class X11ScreenGrabber:
         shminfo.shmid = -1
         cached_self_xid = 0
         cached_toplevel_xid = 0
+        fmt_cache: dict[int, int] = {}
+        xform = _XTransform()
+        scale_x = 1.0
+        scale_y = 1.0
 
         try:
             while not self._stop.is_set():
@@ -330,15 +354,18 @@ class X11ScreenGrabber:
                     time.sleep(0.03)
                     continue
 
-                if w != cur_w or h != cur_h:
+                cw = max(1, w // self.CAPTURE_DIV)
+                ch_px = max(1, h // self.CAPTURE_DIV)
+
+                if cw != cur_w or ch_px != cur_h:
                     cleanup_canvas()
-                    canvas_px = x11.XCreatePixmap(dpy, root, w, h, depth)
+                    canvas_px = x11.XCreatePixmap(dpy, root, cw, ch_px, depth)
                     canvas_pic = xrender.XRenderCreatePicture(dpy, canvas_px, root_fmt, 0, None)
                     ximg = xext.XShmCreateImage(
-                        dpy, vis, depth, self.Z_PIXMAP, None, ctypes.byref(shminfo), w, h
+                        dpy, vis, depth, self.Z_PIXMAP, None, ctypes.byref(shminfo), cw, ch_px
                     )
                     if ximg:
-                        size = ximg.contents.bytes_per_line * h
+                        size = ximg.contents.bytes_per_line * ch_px
                         shmid = libc.shmget(self.IPC_PRIVATE, size, self.IPC_CREAT | 0o600)
                         if shmid >= 0:
                             addr = libc.shmat(shmid, None, 0)
@@ -350,7 +377,26 @@ class X11ScreenGrabber:
                                 shm_attached = bool(xext.XShmAttach(dpy, ctypes.byref(shminfo)))
                                 libc.shmctl(shmid, self.IPC_RMID, None)
                                 shminfo.shmid = -1
-                    cur_w, cur_h = w, h
+                    cur_w, cur_h = cw, ch_px
+                    scale_x = float(w) / float(cw)
+                    scale_y = float(h) / float(ch_px)
+                    fx = int(round(scale_x * 65536.0))
+                    fy = int(round(scale_y * 65536.0))
+                    xform.matrix[0][0] = fx
+                    xform.matrix[0][1] = 0
+                    xform.matrix[0][2] = 0
+                    xform.matrix[1][0] = 0
+                    xform.matrix[1][1] = fy
+                    xform.matrix[1][2] = 0
+                    xform.matrix[2][0] = 0
+                    xform.matrix[2][1] = 0
+                    xform.matrix[2][2] = 65536
+                    tight_bytes = cw * ch_px * 4
+                    with self._lock:
+                        self._cap_w = cw
+                        self._cap_h = ch_px
+                        self._front_buf = (ctypes.c_ubyte * tight_bytes)()
+                        self._back_buf = (ctypes.c_ubyte * tight_bytes)()
 
                 if not (canvas_pic and shm_attached and ximg):
                     time.sleep(0.1)
@@ -361,6 +407,8 @@ class X11ScreenGrabber:
                 p_ret = ctypes.c_ulong()
                 children = ctypes.POINTER(ctypes.c_ulong)()
                 n = ctypes.c_uint()
+                inv_sx = 1.0 / scale_x
+                inv_sy = 1.0 / scale_y
 
                 if x11.XQueryTree(
                     dpy,
@@ -397,11 +445,21 @@ class X11ScreenGrabber:
                             px = xcomp.XCompositeNameWindowPixmap(dpy, win)
                             if not px:
                                 continue
-                            fmt = xrender.XRenderFindVisualFormat(dpy, attr.visual)
+                            vis_key = int(attr.visual or 0)
+                            fmt = fmt_cache.get(vis_key)
+                            if fmt is None and vis_key:
+                                fmt = int(xrender.XRenderFindVisualFormat(dpy, attr.visual) or 0)
+                                fmt_cache[vis_key] = fmt
                             if fmt:
                                 pic = xrender.XRenderCreatePicture(dpy, px, fmt, 0, None)
                                 if pic:
+                                    xrender.XRenderSetPictureTransform(dpy, pic, ctypes.byref(xform))
+                                    xrender.XRenderSetPictureFilter(dpy, pic, b"bilinear", None, 0)
                                     op = self.PICT_OP_OVER if attr.depth == 32 else self.PICT_OP_SRC
+                                    dx = int(round((attr.x - mx) * inv_sx))
+                                    dy = int(round((attr.y - my) * inv_sy))
+                                    dw = max(1, int(round(attr.width * inv_sx)))
+                                    dh = max(1, int(round(attr.height * inv_sy)))
                                     xrender.XRenderComposite(
                                         dpy,
                                         op,
@@ -412,10 +470,10 @@ class X11ScreenGrabber:
                                         0,
                                         0,
                                         0,
-                                        attr.x - mx,
-                                        attr.y - my,
-                                        attr.width,
-                                        attr.height,
+                                        dx,
+                                        dy,
+                                        dw,
+                                        dh,
                                     )
                                     xrender.XRenderFreePicture(dpy, pic)
                             x11.XFreePixmap(dpy, px)
@@ -425,11 +483,21 @@ class X11ScreenGrabber:
 
                 ok = xext.XShmGetImage(dpy, canvas_px, ximg, 0, 0, 0xFFFFFFFF)
                 x11.XSync(dpy, 0)
-                if ok and shminfo.shmaddr:
-                    buf_size = ximg.contents.bytes_per_line * cur_h
-                    raw_bytes = ctypes.string_at(shminfo.shmaddr, buf_size)
+                if ok and shminfo.shmaddr and self._back_buf is not None:
+                    bpl = ximg.contents.bytes_per_line
+                    row_bytes = cur_w * 4
+                    dst_base = ctypes.addressof(self._back_buf)
+                    if bpl == row_bytes:
+                        ctypes.memmove(dst_base, shminfo.shmaddr, row_bytes * cur_h)
+                    else:
+                        for ry in range(cur_h):
+                            ctypes.memmove(
+                                dst_base + ry * row_bytes,
+                                shminfo.shmaddr + ry * bpl,
+                                row_bytes,
+                            )
                     with self._lock:
-                        self._frame_buf = raw_bytes
+                        self._front_buf, self._back_buf = self._back_buf, self._front_buf
                         self._frame_seq += 1
 
                 # 控制在 ~40Hz 采集，给 XServer 留足呼吸空间

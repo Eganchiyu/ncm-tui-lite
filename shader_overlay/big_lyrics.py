@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import array
 import bisect
+import ctypes
 import math
 import statistics
 import time
@@ -126,11 +127,24 @@ class GlyphAtlas:
         if self.surface is None:
             import cairo
 
-            self.surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.ATLAS_W, self.ATLAS_H)
+            self.surface = cairo.ImageSurface(cairo.FORMAT_A8, self.ATLAS_W, self.ATLAS_H)
             self.cr = cairo.Context(self.surface)
             self.dirty_full = True
             self.dirty_y0 = 0
             self.dirty_y1 = self.ATLAS_H
+
+    def release_memory(self) -> None:
+        """在关闭大歌词或隐藏 Shader 窗口时彻底释放 4MB Cairo 离屏表面与缓存。"""
+        self.cr = None
+        self.surface = None
+        self.entries.clear()
+        self._cursor_x = 2
+        self._cursor_y = 2
+        self._row_h = 0
+        self.dirty_full = False
+        self.dirty_y0 = 0
+        self.dirty_y1 = 0
+        self.version += 1
 
     @staticmethod
     def _pick_fonts(pango_ctx: Any) -> tuple[str, str, str]:
@@ -333,25 +347,27 @@ class GlyphAtlas:
         self.version += 1
         return entry
 
-    def consume_dirty_upload(self) -> tuple[bool, int, int, bytes] | None:
-        """若图集有新写入，返回 (is_full, y0, height, raw_bgra_bytes)。"""
+    def consume_dirty_upload(self) -> tuple[bool, int, int, int, Any] | None:
+        """若图集有新写入，返回零拷贝 (is_full, y0, height, data_ptr, keepalive_view)。"""
         if self.surface is None or (not self.dirty_full and self.dirty_y1 <= self.dirty_y0):
             return None
         self.surface.flush()
-        buf = memoryview(self.surface.get_data())
+        mv = memoryview(self.surface.get_data())
         stride = self.surface.get_stride()
+        c_arr = (ctypes.c_ubyte * len(mv)).from_buffer(mv)
+        base_addr = ctypes.addressof(c_arr)
         if self.dirty_full:
             self.dirty_full = False
             self.dirty_y0 = 0
             self.dirty_y1 = 0
-            return True, 0, self.ATLAS_H, bytes(buf)
+            return True, 0, self.ATLAS_H, base_addr, mv
         y0 = max(0, self.dirty_y0)
         y1 = min(self.ATLAS_H, self.dirty_y1)
         self.dirty_y0 = 0
         self.dirty_y1 = 0
         if y1 <= y0:
             return None
-        return False, y0, y1 - y0, bytes(buf[y0 * stride : y1 * stride])
+        return False, y0, y1 - y0, base_addr + y0 * stride, mv
 
 
 # ── 数据结构：词元、单字运动体、活跃句 ───────────────────────────────────────
@@ -455,6 +471,15 @@ class BigLyricsRenderer:
         self._line_counter: int = 0
         self._vbuf: array.array = array.array("f")
         self._vert_count: int = 0
+
+    def release_resources(self) -> None:
+        """清空活跃句并释放底层 Cairo 图集内存。"""
+        self._active_lines.clear()
+        self._current_key = None
+        self.has_content = False
+        del self._vbuf[:]
+        self._vert_count = 0
+        self.atlas.release_memory()
 
     def apply_track(self, msg: dict[str, Any]) -> None:
         self.connected = True
