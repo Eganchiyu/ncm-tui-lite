@@ -10,6 +10,113 @@ _BUTTER4_Q1 = 0.5411961001461970
 _BUTTER4_Q2 = 1.3065629648763766
 
 
+# ── 零复数对象分配的 256 点实数半长 FFT (128 点复数蝶形 + 实频谱解包) ────────
+FFT_N = 256
+_HALF_N = FFT_N // 2  # 128
+_HALF_BITS = _HALF_N.bit_length() - 1  # 7
+
+# 256 点 Hann 窗按偶/奇下标拆分为两路 128 长预计算表，并按 7-bit 位反转重排源下标
+_HANN_256 = tuple(0.5 * (1.0 - math.cos(math.tau * k / (FFT_N - 1))) for k in range(FFT_N))
+_REV_128 = tuple(int(f"{i:0{_HALF_BITS}b}"[::-1], 2) for i in range(_HALF_N))
+_PACK_EVEN_IDX = tuple(_REV_128[i] * 2 for i in range(_HALF_N))
+_PACK_ODD_IDX = tuple(_REV_128[i] * 2 + 1 for i in range(_HALF_N))
+_PACK_EVEN_WIN = tuple(_HANN_256[_PACK_EVEN_IDX[i]] for i in range(_HALF_N))
+_PACK_ODD_WIN = tuple(_HANN_256[_PACK_ODD_IDX[i]] for i in range(_HALF_N))
+
+
+def _build_real_imag_twiddles(m: int) -> tuple[tuple[int, int, tuple[float, ...], tuple[float, ...]], ...]:
+    stages: list[tuple[int, int, tuple[float, ...], tuple[float, ...]]] = []
+    sz = 2
+    while sz <= m:
+        half = sz // 2
+        step = -math.tau / sz
+        w_re = tuple(math.cos(step * k) for k in range(half))
+        w_im = tuple(math.sin(step * k) for k in range(half))
+        stages.append((sz, half, w_re, w_im))
+        sz *= 2
+    return tuple(stages)
+
+
+_RFFT128_STAGES = _build_real_imag_twiddles(_HALF_N)
+_UNPACK_COS = tuple(math.cos(math.tau * k / FFT_N) for k in range(_HALF_N))
+_UNPACK_SIN = tuple(math.sin(math.tau * k / FFT_N) for k in range(_HALF_N))
+
+
+def _rfft256_core(ar: list[float], ai: list[float], scale: float) -> list[float]:
+    """对已装入位反转偶/奇通道的 128 点 (ar, ai) 原地执行蝶形并解包出 128 个归一化幅度。"""
+    for size, half, w_re, w_im in _RFFT128_STAGES:
+        for start in range(0, _HALF_N, size):
+            for k in range(half):
+                j = start + k
+                jh = j + half
+                wr = w_re[k]
+                wi = w_im[k]
+                br = ar[jh]
+                bi = ai[jh]
+                tr = wr * br - wi * bi
+                ti = wr * bi + wi * br
+                ur = ar[j]
+                ui = ai[j]
+                ar[j] = ur + tr
+                ai[j] = ui + ti
+                ar[jh] = ur - tr
+                ai[jh] = ui - ti
+
+    hypot = math.hypot
+    mags = [0.0] * _HALF_N
+    mags[0] = abs(ar[0] + ai[0]) * scale
+    mags[64] = hypot(ar[64], ai[64]) * scale
+
+    u_cos = _UNPACK_COS
+    u_sin = _UNPACK_SIN
+    for k in range(1, 64):
+        kp = _HALF_N - k
+        zr1, zi1 = ar[k], ai[k]
+        zr2, zi2 = ar[kp], ai[kp]
+
+        er = 0.5 * (zr1 + zr2)
+        ei = 0.5 * (zi1 - zi2)
+        or_ = 0.5 * (zi1 + zi2)
+        oi = 0.5 * (zr2 - zr1)
+
+        ck = u_cos[k]
+        sk = u_sin[k]
+        xr1 = er + ck * or_ + sk * oi
+        xi1 = ei + ck * oi - sk * or_
+        mags[k] = hypot(xr1, xi1) * scale
+
+        # 对称点 kp = 128 - k: cos(2pi*(128-k)/256) = -ck, sin(2pi*(128-k)/256) = sk
+        # E[kp] = er - j*ei, O[kp] = or_ - j*oi
+        xr2 = er - ck * or_ - sk * oi
+        xi2 = -ei + ck * oi - sk * or_
+        mags[kp] = hypot(xr2, xi2) * scale
+
+    return mags
+
+
+def rfft256_mags(samples: Sequence[float], offset: int = 0, scale: float = 4.0 / FFT_N) -> list[float]:
+    """计算 samples[offset : offset + 256] 加 Hann 窗后的前 128 个频点幅度（乘以 scale）。"""
+    e_idx = _PACK_EVEN_IDX
+    o_idx = _PACK_ODD_IDX
+    e_win = _PACK_EVEN_WIN
+    o_win = _PACK_ODD_WIN
+    ar = [samples[offset + e_idx[i]] * e_win[i] for i in range(_HALF_N)]
+    ai = [samples[offset + o_idx[i]] * o_win[i] for i in range(_HALF_N)]
+    return _rfft256_core(ar, ai, scale)
+
+
+def rfft256_mags_ring(ring: Sequence[float], head: int, scale: float = 4.0 / FFT_N) -> list[float]:
+    """直接从长 256 的环形缓冲 ring（最老样本位于 head）加窗计算前 128 个频点幅度，零切片拷贝。"""
+    e_idx = _PACK_EVEN_IDX
+    o_idx = _PACK_ODD_IDX
+    e_win = _PACK_EVEN_WIN
+    o_win = _PACK_ODD_WIN
+    mask = FFT_N - 1
+    ar = [ring[(head + e_idx[i]) & mask] * e_win[i] for i in range(_HALF_N)]
+    ai = [ring[(head + o_idx[i]) & mask] * o_win[i] for i in range(_HALF_N)]
+    return _rfft256_core(ar, ai, scale)
+
+
 class Biquad:
     """Direct Form II Transposed 二阶 IIR 滤波器（RBJ Audio EQ Cookbook）。"""
 

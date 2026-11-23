@@ -5,7 +5,6 @@ from __future__ import annotations
 import array
 import asyncio
 import bisect
-import cmath
 import math
 import random
 import subprocess
@@ -25,7 +24,7 @@ import ncm
 from desktop_lyrics import launch_desktop_lyrics
 from lyric_ipc import LyricIpcServer
 from screen_shader import launch_screen_shader
-from shader_overlay.dsp import LowEndFilterBank
+from shader_overlay.dsp import FFT_N, LowEndFilterBank, rfft256_mags
 from player import MpvPlayer, PlayerState
 
 # ── 柔和粉彩调色板（Sakura Twilight Pastel） ─────────────────────────────────
@@ -51,21 +50,7 @@ FG_CREAM = "#ebd3a7"
 PEAK_SR = 12000
 PEAK_HOP = 480  # 40ms/frame -> 25 FPS
 PEAK_FPS = PEAK_SR / PEAK_HOP  # 25.0
-FFT_N = 256
 NUM_BANDS = 24
-
-_FFT_WIN = tuple(0.5 * (1.0 - math.cos(2.0 * math.pi * k / (FFT_N - 1))) for k in range(FFT_N))
-_FFT_BITS = FFT_N.bit_length() - 1
-_FFT_REV = tuple(
-    int(f"{i:0{_FFT_BITS}b}"[::-1], 2) for i in range(FFT_N)
-)
-_FFT_TWIDDLES: list[tuple[int, int, tuple[complex, ...]]] = []
-_sz = 2
-while _sz <= FFT_N:
-    _half = _sz // 2
-    _step = -2j * math.pi / _sz
-    _FFT_TWIDDLES.append((_sz, _half, tuple(cmath.exp(_step * k) for k in range(_half))))
-    _sz *= 2
 
 _BAND_RANGES: list[tuple[int, int, float]] = []
 for _b in range(NUM_BANDS):
@@ -82,25 +67,18 @@ _CLICK_BIN_LO = max(1, int(round(1600.0 * FFT_N / PEAK_SR)))
 _CLICK_BIN_HI = min(FFT_N // 2, int(round(4500.0 * FFT_N / PEAK_SR)) + 1)
 
 
-def _compute_fft_bands_and_click(samples: list[float]) -> tuple[tuple[float, ...], float]:
-    """256 点基-2 FFT：返回 (24 对数频段感知能量 0..1, 1.6~4.5kHz 未削顶线性敲击能量)。"""
-    a = [samples[_FFT_REV[i]] * _FFT_WIN[_FFT_REV[i]] for i in range(FFT_N)]
-    for size, half, wtab in _FFT_TWIDDLES:
-        for start in range(0, FFT_N, size):
-            for k in range(half):
-                t = wtab[k] * a[start + k + half]
-                u = a[start + k]
-                a[start + k] = u + t
-                a[start + k + half] = u - t
-    mags = [abs(a[k]) for k in range(FFT_N // 2)]
+def _compute_fft_bands_and_click(
+    samples: list[float], offset: int = 0
+) -> tuple[tuple[float, ...], float]:
+    """256 点实数半长 FFT：返回 (24 对数频段感知能量 0..1, 1.6~4.5kHz 未削顶线性敲击能量)。"""
+    mags = rfft256_mags(samples, offset)
     out: list[float] = []
-    inv_n = 4.0 / FFT_N
     for i0, i1, tilt in _BAND_RANGES:
-        pk = max(mags[i0:i1]) * inv_n * tilt
+        pk = max(mags[i0:i1]) * tilt
         out.append(min(1.0, math.log1p(pk * 5.2) / 2.25))
     click_slice = mags[_CLICK_BIN_LO:_CLICK_BIN_HI]
     if click_slice:
-        click_lin = math.sqrt(sum(m * m for m in click_slice) / len(click_slice)) * inv_n
+        click_lin = math.sqrt(sum(m * m for m in click_slice) / len(click_slice))
     else:
         click_lin = 0.0
     return tuple(out), click_lin
@@ -425,8 +403,7 @@ class PeakPrecomputer:
                     rms = min(1.0, (math.sqrt(s_sq * inv) ** 0.72) * 1.45)
 
                     sub_rms, body_rms, body_peak, _sub_pk = low_filter.process_block(hop_floats)
-                    fft_slice = hop_floats[win_offset : win_offset + FFT_N]
-                    bands, click_lin = _compute_fft_bands_and_click(fft_slice)
+                    bands, click_lin = _compute_fft_bands_and_click(hop_floats, win_offset)
                     batch.append((peak, rms, bands))
                     low_end_batch.append((sub_rms, body_rms, body_peak, click_lin))
                 timeline.append_batch(batch, low_end_batch)

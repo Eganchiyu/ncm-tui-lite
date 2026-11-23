@@ -229,8 +229,9 @@ def _run_gui(
 
             self._clock = SyncedClock()
             self._lookahead = LookaheadPeakTimeline()
+            self._last_lookahead_mono: float = 0.0
             self._audio = AudioBeatAnalyzer()
-            self._audio.start()
+            self._audio.start(capture_enabled=bool(self._active))
 
             self._grabber = X11ScreenGrabber()
             self._grabber.start()
@@ -408,6 +409,16 @@ def _run_gui(
             if self._clock.is_running():
                 pos = self._clock.position(now)
                 lookahead_sample = self._lookahead.sample_aligned(pos, lookahead_sec)
+                if lookahead_sample is not None:
+                    self._last_lookahead_mono = now
+
+            using_lookahead = (lookahead_sample is not None) or (
+                self._clock.is_running() and (now - self._last_lookahead_mono) < 1.5
+            )
+            need_rt_capture = (self._active or self._intro_phase in ("in", "out")) and (
+                not using_lookahead
+            )
+            self._audio.set_capture_enabled(need_rt_capture)
             self._audio.step(dt, now, lookahead=lookahead_sample)
 
             target_la = 1.0 if (self._big_lyrics_enabled and self._lyrics_renderer.has_content) else 0.0
@@ -433,6 +444,7 @@ def _run_gui(
                     self._intro_phase = "idle"
                     self._intro_active = 0.0
                     self._grabber.set_enabled(False)
+                    self._audio.set_capture_enabled(False)
                     self.hide()
                     self._stop_tick()
                     return False

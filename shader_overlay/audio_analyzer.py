@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import array
-import cmath
 import math
 import random
 import shutil
@@ -12,7 +11,7 @@ import time
 from collections import deque
 from typing import Any
 
-from .dsp import LowEndFilterBank
+from .dsp import FFT_N as _DSP_FFT_N, LowEndFilterBank, rfft256_mags_ring
 
 
 def _cos_tension(x: float) -> float:
@@ -161,6 +160,14 @@ class LookaheadPeakTimeline:
         # (kick_vis, punch, mid, rms, high, b0..b7, sub_rms, body_rms, body_peak, click_lin)
         self.frames: list[tuple[float, ...]] = []
         self._kick_flux: list[float] = []
+        self._stats_cache_key: tuple[int, int] | None = None
+        self._stats_cache_val: tuple[float, float, float, float, float] = (
+            0.12,
+            0.12,
+            0.26,
+            0.085,
+            0.25,
+        )
 
     def _compute_flux_at(self, idx: int) -> float:
         f = self.frames[idx]
@@ -243,6 +250,7 @@ class LookaheadPeakTimeline:
             parsed.append((kick, punch, mid, rms, high, *b8, sub_rms, body_rms, body_peak, click_lin))
 
         with self._lock:
+            self._stats_cache_key = None
             if reset or tid != self.track_id:
                 self.track_id = tid
                 self.fps = max(1.0, fps)
@@ -298,33 +306,40 @@ class LookaheadPeakTimeline:
 
             high_flux = max(0.0, f_curr[4] - (0.55 * f_prev[4] + 0.45 * f_prev2[4]))
 
-            # 1) 持续超低频长时参考（±5.0s 宽窗口，步长 2 降开销，绝不吞掉持续 808）
             sub_half = int(5.0 * fps)
-            s_lo = max(0, idx0 - sub_half)
             s_hi = min(n, idx0 + sub_half + 1)
-            sub_samples = sorted(self.frames[j][13] for j in range(s_lo, s_hi, 2))
-            ref_sub = sub_samples[int(0.92 * (len(sub_samples) - 1))] if sub_samples else 0.12
+            cache_key = (idx0, s_hi)
+            if self._stats_cache_key == cache_key:
+                ref_sub, ref_body, ref_high, flux_thresh, flux_p95 = self._stats_cache_val
+            else:
+                # 1) 持续超低频长时参考（±5.0s 宽窗口，步长 2 降开销，绝不吞掉持续 808）
+                s_lo = max(0, idx0 - sub_half)
+                sub_samples = sorted(self.frames[j][13] for j in range(s_lo, s_hi, 2))
+                ref_sub = sub_samples[int(0.92 * (len(sub_samples) - 1))] if sub_samples else 0.12
 
-            # 2) 中低频与高频局部归一化窗口（±1.25s）
-            win_half = int(1.25 * fps)
-            lo = max(0, idx0 - win_half)
-            hi = min(n, idx0 + win_half + 1)
-            local_bodies = sorted(self.frames[j][14] for j in range(lo, hi))
-            local_highs = sorted(self.frames[j][4] for j in range(lo, hi))
+                # 2) 中低频与高频局部归一化窗口（±1.25s）
+                win_half = int(1.25 * fps)
+                lo = max(0, idx0 - win_half)
+                hi = min(n, idx0 + win_half + 1)
+                local_bodies = sorted(self.frames[j][14] for j in range(lo, hi))
+                local_highs = sorted(self.frames[j][4] for j in range(lo, hi))
+                ref_body = local_bodies[int(0.92 * (len(local_bodies) - 1))] if local_bodies else 0.12
+                ref_high = local_highs[int(0.88 * (len(local_highs) - 1))] if local_highs else 0.26
 
-            # 3) 底鼓瞬态自适应局部窗口（±0.55s，约 1.1s）
-            flux_half = int(0.55 * fps)
-            fl_lo = max(0, idx0 - flux_half)
-            fl_hi = min(n, idx0 + flux_half + 1)
-            local_fluxes = self._kick_flux[fl_lo:fl_hi]
+                # 3) 底鼓瞬态自适应局部窗口（±0.55s，约 1.1s）
+                flux_half = int(0.55 * fps)
+                fl_lo = max(0, idx0 - flux_half)
+                fl_hi = min(n, idx0 + flux_half + 1)
+                flux_thresh, flux_p95 = _adaptive_threshold(
+                    self._kick_flux[fl_lo:fl_hi], min_floor=0.085, mad_k=1.55
+                )
+                self._stats_cache_key = cache_key
+                self._stats_cache_val = (ref_sub, ref_body, ref_high, flux_thresh, flux_p95)
 
             f0 = self._kick_flux[idx0]
             f_m1 = self._kick_flux[max(0, idx0 - 1)]
             f_p1 = self._kick_flux[min(n - 1, idx0 + 1)]
             curr_flux = f0 + (f_p1 - f0) * frac
-
-        ref_body = local_bodies[int(0.92 * (len(local_bodies) - 1))] if local_bodies else 0.12
-        ref_high = local_highs[int(0.88 * (len(local_highs) - 1))] if local_highs else 0.26
 
         # 稳态 Sub-bass 包络
         sub_env = _sub_sustain_env(sub_rms, ref_sub)
@@ -337,7 +352,6 @@ class LookaheadPeakTimeline:
         body_env = _cos_tension(x_body)
 
         # 底鼓瞬态通量与自适应峰值拾取
-        flux_thresh, flux_p95 = _adaptive_threshold(local_fluxes, min_floor=0.085, mad_k=1.55)
         x_onset = max(
             0.0,
             min(1.0, (curr_flux - flux_thresh * 0.65) / max(0.14, flux_p95 - flux_thresh * 0.65)),
@@ -377,17 +391,6 @@ class LookaheadPeakTimeline:
         )
 
 
-def _build_fft_twiddles(n: int) -> list[tuple[int, int, tuple[complex, ...]]]:
-    twiddles: list[tuple[int, int, tuple[complex, ...]]] = []
-    sz = 2
-    while sz <= n:
-        half = sz // 2
-        step = -2j * math.pi / sz
-        twiddles.append((sz, half, tuple(cmath.exp(step * k) for k in range(half))))
-        sz *= 2
-    return twiddles
-
-
 def _build_log_band_ranges(fft_n: int, num_bands: int = 8) -> tuple[tuple[int, int, float], ...]:
     ranges: list[tuple[int, int, float]] = []
     max_bin = fft_n // 2
@@ -406,10 +409,7 @@ class AudioBeatAnalyzer:
 
     SAMPLE_RATE = 22050
     CHUNK_SAMPLES = 330  # ~15ms
-    FFT_N = 256
-    _FFT_WIN = tuple(0.5 * (1.0 - math.cos(2.0 * math.pi * k / 255)) for k in range(256))
-    _FFT_REV = tuple(int(f"{i:08b}"[::-1], 2) for i in range(256))
-    _FFT_TWIDDLES = _build_fft_twiddles(256)
+    FFT_N = _DSP_FFT_N
     _BAND8_RANGES = _build_log_band_ranges(256, 8)
     _CLICK_BIN_LO = max(1, int(round(1600.0 * 256 / 22050.0)))  # bin 19 (~1636 Hz)
     _CLICK_BIN_HI = min(128, int(round(4500.0 * 256 / 22050.0)) + 1)  # bin 53 (~4565 Hz)
@@ -417,6 +417,7 @@ class AudioBeatAnalyzer:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._capture_enabled = threading.Event()
         self._proc: subprocess.Popen[bytes] | None = None
         self._thread: threading.Thread | None = None
 
@@ -455,7 +456,8 @@ class AudioBeatAnalyzer:
         self._last_beat_onset: float = 0.0
 
         self._low_filter = LowEndFilterBank(self.SAMPLE_RATE, decimate=4)
-        self._pcm_ring: deque[float] = deque([0.0] * self.FFT_N, maxlen=self.FFT_N)
+        self._pcm_ring: list[float] = [0.0] * self.FFT_N
+        self._ring_head: int = 0
 
         self._raw_energy: float = 0.0
         self._raw_sub: float = 0.0
@@ -487,15 +489,35 @@ class AudioBeatAnalyzer:
         self._rt_last_peak_at: float = 0.0
         self._rt_sim_time: float = 0.0
 
-    def start(self) -> None:
+    def start(self, capture_enabled: bool = False) -> None:
+        if capture_enabled:
+            self._capture_enabled.set()
+        else:
+            self._capture_enabled.clear()
         if self._thread is not None:
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
 
+    def set_capture_enabled(self, enabled: bool) -> None:
+        """按需启停底层 parec 实时采集与 FFT（隐藏态或已有 TUI lookahead 时零后台开销）。"""
+        if enabled:
+            self._capture_enabled.set()
+            return
+        if not self._capture_enabled.is_set() and self._proc is None:
+            return
+        self._capture_enabled.clear()
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+
     def stop(self) -> None:
         self._stop.set()
+        self._capture_enabled.set()
         proc = self._proc
         if proc is not None:
             try:
@@ -525,6 +547,11 @@ class AudioBeatAnalyzer:
     def _capture_loop(self) -> None:
         chunk_bytes = self.CHUNK_SAMPLES * 2
         while not self._stop.is_set():
+            if not self._capture_enabled.wait(timeout=0.35):
+                continue
+            if self._stop.is_set():
+                break
+
             monitor = self._find_monitor_source()
             cmd = [
                 "parec",
@@ -549,24 +576,26 @@ class AudioBeatAnalyzer:
 
             assert proc.stdout is not None
             try:
-                while not self._stop.is_set():
+                while not self._stop.is_set() and self._capture_enabled.is_set():
                     raw = proc.stdout.read(chunk_bytes)
                     if not raw:
                         break
-                    if len(raw) < 4:
+                    if len(raw) < 4 or not self._capture_enabled.is_set():
                         continue
                     self._process_pcm(raw)
             except Exception:  # noqa: BLE001
                 pass
             finally:
                 try:
+                    if proc.stdout:
+                        proc.stdout.close()
                     proc.terminate()
                     proc.wait(timeout=0.5)
                 except Exception:  # noqa: BLE001
                     pass
                 self._proc = None
 
-            if not self._stop.is_set():
+            if not self._stop.is_set() and self._capture_enabled.is_set():
                 time.sleep(1.0)
 
     def _process_pcm(self, raw: bytes) -> None:
@@ -582,28 +611,22 @@ class AudioBeatAnalyzer:
 
         sum_tot = 0.0
         inv_scale = 1.0 / 32768.0
-        chunk_floats: list[float] = []
-        for s in samples:
+        chunk_floats = [0.0] * n
+        ring = self._pcm_ring
+        head = self._ring_head
+        mask = self.FFT_N - 1
+        for i, s in enumerate(samples):
             x = s * inv_scale
-            chunk_floats.append(x)
+            chunk_floats[i] = x
             sum_tot += x * x
-            self._pcm_ring.append(x)
+            ring[head] = x
+            head = (head + 1) & mask
+        self._ring_head = head
 
         rms_tot = math.sqrt(sum_tot / n)
         sub_rms, body_rms, body_peak, _sub_pk = self._low_filter.process_block(chunk_floats)
 
-        ring = list(self._pcm_ring)
-        a = [ring[self._FFT_REV[i]] * self._FFT_WIN[self._FFT_REV[i]] for i in range(self.FFT_N)]
-        for size, half, wtab in self._FFT_TWIDDLES:
-            for start in range(0, self.FFT_N, size):
-                for k in range(half):
-                    t = wtab[k] * a[start + k + half]
-                    u = a[start + k]
-                    a[start + k] = u + t
-                    a[start + k + half] = u - t
-
-        inv_n = 4.0 / self.FFT_N
-        mags = [abs(a[k]) * inv_n for k in range(self.FFT_N // 2)]
+        mags = rfft256_mags_ring(ring, head)
 
         bands8: list[float] = []
         for i0, i1, tilt in self._BAND8_RANGES:
