@@ -164,33 +164,38 @@ def fmt_time(seconds: float) -> str:
 
 # ── 流式音频 Peak & FFT 频谱预计算引擎 ────────────────────────────────────────
 class PeakTimeline:
-    """线程安全的渐进式音频波形 Peak + 24 频段 FFT 频谱时间轴（25Hz）。"""
+    """线程安全的渐进式音频波形 Peak + 24 频段 FFT 频谱时间轴（25Hz 紧凑 float32 连续数组）。"""
+
+    # 每帧固定 30 个 float32:
+    # [0]: peak, [1]: rms, [2..25]: bands_24, [26]: sub_rms, [27]: body_rms, [28]: body_peak, [29]: click_lin
+    STRIDE = 2 + NUM_BANDS + 4  # 30
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # 每帧: (peak, rms, bands_24)
-        self.frames: list[tuple[float, float, tuple[float, ...]]] = []
-        # 与 frames 等长的未削顶低频与瞬态线性特征: (sub_rms, body_rms, body_peak, click_lin)
-        self.low_end: list[tuple[float, float, float, float]] = []
+        self._data: array.array = array.array("f")
         self.done: bool = False
+
+    def frame_count(self) -> int:
+        with self._lock:
+            return len(self._data) // self.STRIDE
 
     def computed_seconds(self) -> float:
         with self._lock:
-            return len(self.frames) / PEAK_FPS
+            return (len(self._data) // self.STRIDE) / PEAK_FPS
 
-    def append_batch(
-        self,
-        batch: list[tuple[float, float, tuple[float, ...]]],
-        low_end_batch: list[tuple[float, float, float, float]] | None = None,
-    ) -> None:
-        if not batch:
+    def append_flat(self, flat: array.array) -> None:
+        if not flat:
             return
         with self._lock:
-            self.frames.extend(batch)
-            if low_end_batch is not None:
-                self.low_end.extend(low_end_batch)
-            else:
-                self.low_end.extend([(0.0, 0.0, 0.0, 0.0)] * len(batch))
+            self._data.extend(flat)
+
+    def copy_range(self, start_idx: int) -> tuple[int, array.array] | None:
+        s = self.STRIDE
+        with self._lock:
+            total = len(self._data) // s
+            if total <= start_idx:
+                return None
+            return start_idx, self._data[start_idx * s : total * s]
 
     def mark_done(self) -> None:
         with self._lock:
@@ -203,23 +208,34 @@ class PeakTimeline:
         idx_f = sec * PEAK_FPS
         idx0 = int(idx_f)
         frac = idx_f - idx0
+        s = self.STRIDE
         with self._lock:
-            n = len(self.frames)
+            d = self._data
+            n = len(d) // s
             if n == 0 or idx0 >= n:
                 return None
-            p0, r0, b0 = self.frames[idx0]
+            o0 = idx0 * s
+            p0 = d[o0]
+            r0 = d[o0 + 1]
             if idx0 + 1 >= n:
-                return p0, r0, list(b0)
-            p1, r1, b1 = self.frames[idx0 + 1]
-        bands = [b0[k] + (b1[k] - b0[k]) * frac for k in range(NUM_BANDS)]
+                return p0, r0, [d[o0 + 2 + k] for k in range(NUM_BANDS)]
+            o1 = o0 + s
+            p1 = d[o1]
+            r1 = d[o1 + 1]
+            bands = [
+                d[o0 + 2 + k] + (d[o1 + 2 + k] - d[o0 + 2 + k]) * frac
+                for k in range(NUM_BANDS)
+            ]
         return p0 + (p1 - p0) * frac, r0 + (r1 - r0) * frac, bands
 
     def sample_waveform(
         self, center_sec: float, half_span_sec: float, count: int
     ) -> list[tuple[float, float]] | None:
         """读取 [center - span, center + span] 区间 count 个点的 (peak, rms)。"""
+        s = self.STRIDE
         with self._lock:
-            n = len(self.frames)
+            d = self._data
+            n = len(d) // s
             if n == 0:
                 return None
             max_idx = n - 1
@@ -230,7 +246,8 @@ class PeakTimeline:
                 rel = ((i / max(1, count - 1)) * 2.0 - 1.0) * half_span_sec
                 idx = int(round((center_sec + rel) * PEAK_FPS))
                 if 0 <= idx <= max_idx:
-                    out.append((self.frames[idx][0], self.frames[idx][1]))
+                    off = idx * s
+                    out.append((d[off], d[off + 1]))
                 else:
                     out.append((0.0, 0.0))
             return out
@@ -383,14 +400,13 @@ class PeakPrecomputer:
                 if sys.byteorder != "little":
                     pcm.byteswap()
 
-                batch: list[tuple[float, float, tuple[float, ...]]] = []
-                low_end_batch: list[tuple[float, float, float, float]] = []
+                flat_batch = array.array("f")
                 inv = 1.0 / PEAK_HOP
                 inv_scale = 1.0 / 32768.0
+                hop_floats = [0.0] * PEAK_HOP
                 for start in range(0, len(pcm), PEAK_HOP):
                     mx = 0
                     s_sq = 0.0
-                    hop_floats = [0.0] * PEAK_HOP
                     for j in range(PEAK_HOP):
                         raw_s = pcm[start + j]
                         ar = raw_s if raw_s >= 0 else -raw_s
@@ -404,9 +420,8 @@ class PeakPrecomputer:
 
                     sub_rms, body_rms, body_peak, _sub_pk = low_filter.process_block(hop_floats)
                     bands, click_lin = _compute_fft_bands_and_click(hop_floats, win_offset)
-                    batch.append((peak, rms, bands))
-                    low_end_batch.append((sub_rms, body_rms, body_peak, click_lin))
-                timeline.append_batch(batch, low_end_batch)
+                    flat_batch.extend((peak, rms, *bands, sub_rms, body_rms, body_peak, click_lin))
+                timeline.append_flat(flat_batch)
         except Exception:  # noqa: BLE001
             pass
         finally:
@@ -1285,7 +1300,10 @@ class NcmTuiApp(App):
 
     async def on_mount(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._lyric_ipc = LyricIpcServer(on_command=self._on_lyric_ipc_cmd)
+        self._lyric_ipc = LyricIpcServer(
+            on_command=self._on_lyric_ipc_cmd,
+            on_peaks_subscriber=self._on_peaks_subscriber,
+        )
         try:
             self._lyric_ipc.start()
         except OSError:
@@ -1325,46 +1343,70 @@ class NcmTuiApp(App):
             self._lyric_ipc.close()
             self._lyric_ipc = None
 
+    def _on_peaks_subscriber(self) -> None:
+        if self._loop and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._resync_peaks_for_subscriber)
+
+    def _resync_peaks_for_subscriber(self) -> None:
+        ipc = self._lyric_ipc
+        tid = self._peaks_sent_tid
+        if ipc is None or not tid or self._current_peaks is None:
+            return
+        self._peaks_sent_idx = 0
+        ipc.publish_peaks(track_id=tid, fps=PEAK_FPS, start_idx=0, frames=[], reset=True)
+        self._flush_peaks_ipc()
+
     def _flush_peaks_ipc(self) -> None:
         ipc = self._lyric_ipc
         tl = self._current_peaks
         tid = self._peaks_sent_tid
-        if ipc is None or tl is None or not tid:
+        if ipc is None or tl is None or not tid or not ipc.has_peak_clients():
             return
-        with tl._lock:
-            total = len(tl.frames)
-            if total <= self._peaks_sent_idx:
-                return
-            start_idx = self._peaks_sent_idx
-            slice_frames = tl.frames[start_idx:total]
-            slice_low = tl.low_end[start_idx:total] if len(tl.low_end) >= total else []
+        copied = tl.copy_range(self._peaks_sent_idx)
+        if copied is None:
+            return
+        start_idx, raw_slice = copied
+        s = PeakTimeline.STRIDE
+        n_frames = len(raw_slice) // s
         batch: list[list[float]] = []
-        for idx, (_pk, rms, bands) in enumerate(slice_frames):
-            n_b = len(bands)
-            kick = sum(bands[0:3]) / 3.0 if n_b >= 3 else 0.0
-            punch = sum(bands[3:6]) / 3.0 if n_b >= 6 else 0.0
-            mid = sum(bands[6:14]) / 8.0 if n_b >= 14 else 0.0
-            high = sum(bands[14:24]) / 10.0 if n_b >= 24 else 0.0
-            if n_b >= 24:
-                b8 = [round(sum(bands[i * 3 : (i + 1) * 3]) / 3.0, 3) for i in range(8)]
-            else:
-                b8 = [round(kick, 3), round(punch, 3), round(mid, 3), round(mid, 3), round(high, 3), round(high, 3), round(high, 3), round(high, 3)]
-            if idx < len(slice_low):
-                sub_rms, body_rms, body_peak, click_lin = slice_low[idx]
-            else:
-                sub_rms = body_rms = body_peak = click_lin = 0.0
-            batch.append([
-                round(kick, 3),
-                round(punch, 3),
-                round(mid, 3),
-                round(rms, 3),
-                round(high, 3),
-                *b8,
-                round(sub_rms, 4),
-                round(body_rms, 4),
-                round(body_peak, 4),
-                round(click_lin, 4),
-            ])
+        for idx in range(n_frames):
+            off = idx * s
+            rms = raw_slice[off + 1]
+            b_base = off + 2
+            kick = (raw_slice[b_base] + raw_slice[b_base + 1] + raw_slice[b_base + 2]) / 3.0
+            punch = (raw_slice[b_base + 3] + raw_slice[b_base + 4] + raw_slice[b_base + 5]) / 3.0
+            mid = sum(raw_slice[b_base + 6 : b_base + 14]) / 8.0
+            high = sum(raw_slice[b_base + 14 : b_base + 24]) / 10.0
+            b8 = [
+                round(
+                    (
+                        raw_slice[b_base + i * 3]
+                        + raw_slice[b_base + i * 3 + 1]
+                        + raw_slice[b_base + i * 3 + 2]
+                    )
+                    / 3.0,
+                    3,
+                )
+                for i in range(8)
+            ]
+            sub_rms = raw_slice[off + 26]
+            body_rms = raw_slice[off + 27]
+            body_peak = raw_slice[off + 28]
+            click_lin = raw_slice[off + 29]
+            batch.append(
+                [
+                    round(kick, 3),
+                    round(punch, 3),
+                    round(mid, 3),
+                    round(rms, 3),
+                    round(high, 3),
+                    *b8,
+                    round(sub_rms, 4),
+                    round(body_rms, 4),
+                    round(body_peak, 4),
+                    round(click_lin, 4),
+                ]
+            )
         self._peaks_sent_idx = start_idx + len(batch)
         ipc.publish_peaks(track_id=tid, fps=PEAK_FPS, start_idx=start_idx, frames=batch)
 
@@ -1657,7 +1699,7 @@ class NcmTuiApp(App):
             self._current_peaks = cached_peaks
         else:
             timeline = PeakTimeline()
-            if len(self._peak_cache) >= 6:
+            if len(self._peak_cache) >= 3:
                 self._peak_cache.pop(next(iter(self._peak_cache)))
             self._peak_cache[tid] = timeline
             self._current_peaks = timeline

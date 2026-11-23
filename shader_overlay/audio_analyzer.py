@@ -152,14 +152,16 @@ class SyncedClock:
 class LookaheadPeakTimeline:
     """前瞻式 25Hz 多频段 FFT + 低频分频时间轴：长时稳态 808 + 自适应瞬态峰值底鼓检测。"""
 
+    STRIDE = 17
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.track_id: int | None = None
         self.fps: float = 25.0
-        # 每帧统一归一化为 17 元组:
+        # 扁平 float32 数组，每帧固定 17 个 float:
         # (kick_vis, punch, mid, rms, high, b0..b7, sub_rms, body_rms, body_peak, click_lin)
-        self.frames: list[tuple[float, ...]] = []
-        self._kick_flux: list[float] = []
+        self._data: array.array = array.array("f")
+        self._kick_flux: array.array = array.array("f")
         self._stats_cache_key: tuple[int, int] | None = None
         self._stats_cache_val: tuple[float, float, float, float, float] = (
             0.12,
@@ -170,12 +172,13 @@ class LookaheadPeakTimeline:
         )
 
     def _compute_flux_at(self, idx: int) -> float:
-        f = self.frames[idx]
-        mid_e = f[2]
-        high_e = f[4]
-        sub_e = f[13]
-        body_e = 0.55 * f[14] + 0.45 * f[15]
-        click_e = f[16]
+        d = self._data
+        off = idx * self.STRIDE
+        mid_e = d[off + 2]
+        high_e = d[off + 4]
+        sub_e = d[off + 13]
+        body_e = 0.55 * d[off + 14] + 0.45 * d[off + 15]
+        click_e = d[off + 16]
 
         # 基底取前 2~6 帧（80~240ms 之前）：避开底鼓自身 1 帧起坡，同时完全吸收持续 808 稳态
         b_hi = max(0, idx - 1)
@@ -190,10 +193,10 @@ class LookaheadPeakTimeline:
         sum_sub = 0.0
         sum_click = 0.0
         for j in range(b_lo, b_hi):
-            fj = self.frames[j]
-            sum_body += _log_lin(0.55 * fj[14] + 0.45 * fj[15], 18.0)
-            sum_sub += _log_lin(fj[13], 16.0)
-            sum_click += _log_lin(fj[16], 22.0)
+            joff = j * self.STRIDE
+            sum_body += _log_lin(0.55 * d[joff + 14] + 0.45 * d[joff + 15], 18.0)
+            sum_sub += _log_lin(d[joff + 13], 16.0)
+            sum_click += _log_lin(d[joff + 16], 22.0)
         inv = 1.0 / cnt
         return _kick_flux_score(
             body_e=body_e,
@@ -207,10 +210,11 @@ class LookaheadPeakTimeline:
         )
 
     def _rebuild_flux_from(self, start_idx: int) -> None:
-        n = len(self.frames)
-        if len(self._kick_flux) < n:
-            self._kick_flux.extend([0.0] * (n - len(self._kick_flux)))
-        elif len(self._kick_flux) > n:
+        n = len(self._data) // self.STRIDE
+        cur_f = len(self._kick_flux)
+        if cur_f < n:
+            self._kick_flux.extend([0.0] * (n - cur_f))
+        elif cur_f > n:
             del self._kick_flux[n:]
         lo = max(0, start_idx)
         for i in range(lo, n):
@@ -222,7 +226,7 @@ class LookaheadPeakTimeline:
         start = int(msg.get("start", 0) or 0)
         reset = bool(msg.get("reset", False))
         raw_frames = msg.get("frames") or []
-        parsed: list[tuple[float, ...]] = []
+        flat = array.array("f")
         for f in raw_frames:
             if not isinstance(f, (list, tuple)) or len(f) < 4:
                 continue
@@ -232,7 +236,16 @@ class LookaheadPeakTimeline:
             rms = float(f[3])
             if len(f) >= 13:
                 high = float(f[4])
-                b8 = tuple(float(f[5 + k]) for k in range(8))
+                b8 = (
+                    float(f[5]),
+                    float(f[6]),
+                    float(f[7]),
+                    float(f[8]),
+                    float(f[9]),
+                    float(f[10]),
+                    float(f[11]),
+                    float(f[12]),
+                )
             else:
                 high = float(f[4]) if len(f) >= 5 else min(1.0, mid * 0.72 + punch * 0.25)
                 b8 = (kick, punch, (punch + mid) * 0.5, mid, mid, high, high, high * 0.9)
@@ -242,28 +255,29 @@ class LookaheadPeakTimeline:
                 body_peak = float(f[15])
                 click_lin = float(f[16])
             else:
-                # 向后兼容旧版 4 维/13 维 IPC 帧
                 sub_rms = kick * 0.22
                 body_rms = punch * 0.20
                 body_peak = punch * 0.28
                 click_lin = high * 0.16
-            parsed.append((kick, punch, mid, rms, high, *b8, sub_rms, body_rms, body_peak, click_lin))
+            flat.extend((kick, punch, mid, rms, high, *b8, sub_rms, body_rms, body_peak, click_lin))
 
+        s = self.STRIDE
+        parsed_n = len(flat) // s
         with self._lock:
             self._stats_cache_key = None
+            cur_n = len(self._data) // s
             if reset or tid != self.track_id:
                 self.track_id = tid
                 self.fps = max(1.0, fps)
-                self.frames = parsed
-                self._kick_flux = []
+                self._data = flat
+                self._kick_flux = array.array("f")
                 self._rebuild_flux_from(0)
                 return
-            if start == len(self.frames):
-                base_idx = len(self.frames)
-                self.frames.extend(parsed)
-                self._rebuild_flux_from(base_idx)
-            elif start < len(self.frames):
-                self.frames[start : start + len(parsed)] = parsed
+            if start == cur_n:
+                self._data.extend(flat)
+                self._rebuild_flux_from(cur_n)
+            elif start < cur_n:
+                self._data[start * s : (start + parsed_n) * s] = flat
                 self._rebuild_flux_from(start)
 
     def sample_aligned(
@@ -273,8 +287,10 @@ class LookaheadPeakTimeline:
         (energy, sub_env, body_env, mid, high_env, warp_tension, kick_onset, sparkle, centroid, bands8, kick_peak_strength)。
         """
         target_sec = max(0.0, pos_sec + lookahead_sec)
+        s = self.STRIDE
         with self._lock:
-            n = len(self.frames)
+            d = self._data
+            n = len(d) // s
             if n < 3:
                 return None
             fps = self.fps
@@ -283,15 +299,12 @@ class LookaheadPeakTimeline:
             if idx0 >= n:
                 return None
 
-            def get_frame(i: int) -> tuple[float, ...]:
-                return self.frames[max(0, min(n - 1, i))]
-
             frac = idx_f - idx0
 
             def interp(i: int) -> list[float]:
-                a = get_frame(i)
-                b = get_frame(i + 1)
-                return [a[k] + (b[k] - a[k]) * frac for k in range(17)]
+                ia = max(0, min(n - 1, i)) * s
+                ib = max(0, min(n - 1, i + 1)) * s
+                return [d[ia + k] + (d[ib + k] - d[ia + k]) * frac for k in range(17)]
 
             f_prev2 = interp(idx0 - 2)
             f_prev = interp(idx0 - 1)
@@ -312,26 +325,23 @@ class LookaheadPeakTimeline:
             if self._stats_cache_key == cache_key:
                 ref_sub, ref_body, ref_high, flux_thresh, flux_p95 = self._stats_cache_val
             else:
-                # 1) 持续超低频长时参考（±5.0s 宽窗口，步长 2 降开销，绝不吞掉持续 808）
                 s_lo = max(0, idx0 - sub_half)
-                sub_samples = sorted(self.frames[j][13] for j in range(s_lo, s_hi, 2))
+                sub_samples = sorted(d[j * s + 13] for j in range(s_lo, s_hi, 2))
                 ref_sub = sub_samples[int(0.92 * (len(sub_samples) - 1))] if sub_samples else 0.12
 
-                # 2) 中低频与高频局部归一化窗口（±1.25s）
                 win_half = int(1.25 * fps)
                 lo = max(0, idx0 - win_half)
                 hi = min(n, idx0 + win_half + 1)
-                local_bodies = sorted(self.frames[j][14] for j in range(lo, hi))
-                local_highs = sorted(self.frames[j][4] for j in range(lo, hi))
+                local_bodies = sorted(d[j * s + 14] for j in range(lo, hi))
+                local_highs = sorted(d[j * s + 4] for j in range(lo, hi))
                 ref_body = local_bodies[int(0.92 * (len(local_bodies) - 1))] if local_bodies else 0.12
                 ref_high = local_highs[int(0.88 * (len(local_highs) - 1))] if local_highs else 0.26
 
-                # 3) 底鼓瞬态自适应局部窗口（±0.55s，约 1.1s）
                 flux_half = int(0.55 * fps)
                 fl_lo = max(0, idx0 - flux_half)
                 fl_hi = min(n, idx0 + flux_half + 1)
                 flux_thresh, flux_p95 = _adaptive_threshold(
-                    self._kick_flux[fl_lo:fl_hi], min_floor=0.085, mad_k=1.55
+                    list(self._kick_flux[fl_lo:fl_hi]), min_floor=0.085, mad_k=1.55
                 )
                 self._stats_cache_key = cache_key
                 self._stats_cache_val = (ref_sub, ref_body, ref_high, flux_thresh, flux_p95)

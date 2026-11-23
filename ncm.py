@@ -613,17 +613,42 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 class AudioStreamProxy:
     """本地流式缓存代理：让探测、mpv 与 ffmpeg 共享唯一一条 CDN 下载流。"""
 
-    MAX_CACHED_FILES = 6
+    MAX_CACHED_FILES = 2
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         uid = os.getuid() if hasattr(os, "getuid") else 0
-        self._dir = Path(tempfile.gettempdir()) / f"ncm_lite_streams_{uid}_{os.getpid()}"
+        streams_root = _get_cache_dir() / "streams"
+        streams_root.mkdir(parents=True, exist_ok=True)
+        self._cleanup_stale_dirs(streams_root, f"s_{uid}_")
+        self._dir = streams_root / f"s_{uid}_{os.getpid()}"
         self._dir.mkdir(parents=True, exist_ok=True)
         self._sessions: collections.OrderedDict[str, _StreamSession] = collections.OrderedDict()
         self._server: _ThreadingHTTPServer | None = None
         self._port: int = 0
         atexit.register(self.close)
+
+    @staticmethod
+    def _cleanup_stale_dirs(root: Path, prefix: str) -> None:
+        my_pid = os.getpid()
+        try:
+            for child in root.iterdir():
+                if not child.is_dir() or not child.name.startswith(prefix):
+                    continue
+                pid_part = child.name[len(prefix) :]
+                if not pid_part.isdigit():
+                    continue
+                pid = int(pid_part)
+                if pid == my_pid:
+                    continue
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    shutil.rmtree(child, ignore_errors=True)
+                except PermissionError:
+                    pass
+        except OSError:
+            pass
 
     def _ensure_server(self) -> int:
         with self._lock:

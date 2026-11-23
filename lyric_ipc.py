@@ -26,16 +26,16 @@ class LyricIpcServer:
         self,
         sock_path: str | None = None,
         on_command: Callable[[dict[str, Any]], None] | None = None,
+        on_peaks_subscriber: Callable[[], None] | None = None,
     ) -> None:
         self.sock_path = sock_path or get_lyric_sock_path()
         self._on_command = on_command
+        self._on_peaks_subscriber = on_peaks_subscriber
         self._lock = threading.Lock()
         self._clients: list[socket.socket] = []
+        self._peak_clients: set[socket.socket] = set()
         self._last_track_bytes: bytes | None = None
         self._last_state_bytes: bytes | None = None
-        self._peaks_track_id: int | None = None
-        self._peaks_fps: float = 25.0
-        self._peaks_frames: list[list[float]] = []
         self._closed = False
         self._server_sock: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
@@ -62,6 +62,10 @@ class LyricIpcServer:
         with self._lock:
             return bool(self._clients)
 
+    def has_peak_clients(self) -> bool:
+        with self._lock:
+            return bool(self._peak_clients)
+
     def _accept_loop(self) -> None:
         srv = self._server_sock
         if srv is None:
@@ -78,18 +82,7 @@ class LyricIpcServer:
                 self._clients.append(conn)
                 track_bytes = self._last_track_bytes
                 state_bytes = self._last_state_bytes
-                peaks_bytes: bytes | None = None
-                if self._peaks_track_id is not None and self._peaks_frames:
-                    peaks_msg = {
-                        "type": "peaks",
-                        "track_id": self._peaks_track_id,
-                        "fps": self._peaks_fps,
-                        "start": 0,
-                        "reset": True,
-                        "frames": list(self._peaks_frames),
-                    }
-                    peaks_bytes = (json.dumps(peaks_msg, separators=(",", ":")) + "\n").encode("utf-8")
-            for payload in (track_bytes, state_bytes, peaks_bytes):
+            for payload in (track_bytes, state_bytes):
                 if payload:
                     if not self._send_one(conn, payload):
                         self._drop_client(conn)
@@ -126,11 +119,27 @@ class LyricIpcServer:
                         msg = json.loads(line.decode("utf-8", "replace"))
                     except json.JSONDecodeError:
                         continue
-                    if isinstance(msg, dict) and self._on_command:
-                        try:
-                            self._on_command(msg)
-                        except Exception:  # noqa: BLE001
-                            pass
+                    if isinstance(msg, dict):
+                        mtype = msg.get("type")
+                        if mtype == "hello":
+                            want_peaks = bool(msg.get("want_peaks", False))
+                            added = False
+                            with self._lock:
+                                if want_peaks and conn in self._clients and conn not in self._peak_clients:
+                                    self._peak_clients.add(conn)
+                                    added = True
+                                elif not want_peaks:
+                                    self._peak_clients.discard(conn)
+                            if added and self._on_peaks_subscriber:
+                                try:
+                                    self._on_peaks_subscriber()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                        elif self._on_command:
+                            try:
+                                self._on_command(msg)
+                            except Exception:  # noqa: BLE001
+                                pass
         finally:
             self._drop_client(conn)
 
@@ -138,6 +147,7 @@ class LyricIpcServer:
         with self._lock:
             if conn in self._clients:
                 self._clients.remove(conn)
+            self._peak_clients.discard(conn)
         try:
             conn.close()
         except OSError:
@@ -218,20 +228,12 @@ class LyricIpcServer:
         frames: list[list[float]],
         reset: bool = False,
     ) -> None:
-        """增量广播预计算的鼓点/频段前瞻时间轴（仅在 TUI 播放时供 Shader 做零延迟重心对齐）。"""
-        with self._lock:
-            if reset or self._peaks_track_id != track_id:
-                self._peaks_track_id = track_id
-                self._peaks_fps = float(fps)
-                self._peaks_frames = list(frames)
-                start_idx = 0
-                reset = True
-            else:
-                if start_idx == len(self._peaks_frames):
-                    self._peaks_frames.extend(frames)
-                elif start_idx < len(self._peaks_frames):
-                    self._peaks_frames[start_idx : start_idx + len(frames)] = frames
+        """增量广播预计算的鼓点/频段前瞻时间轴（仅发给声明 want_peaks 的 Shader 客户端，零服务端副本堆积）。"""
         if not frames and not reset:
+            return
+        with self._lock:
+            targets = list(self._peak_clients)
+        if not targets:
             return
         msg = {
             "type": "peaks",
@@ -242,7 +244,12 @@ class LyricIpcServer:
             "frames": frames,
         }
         raw = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
-        self._broadcast_bytes(raw)
+        dead: list[socket.socket] = []
+        for conn in targets:
+            if not self._send_one(conn, raw):
+                dead.append(conn)
+        for conn in dead:
+            self._drop_client(conn)
 
     def send_control(self, action: str) -> bool:
         if not self.has_clients():
@@ -258,6 +265,7 @@ class LyricIpcServer:
         with self._lock:
             clients = list(self._clients)
             self._clients.clear()
+            self._peak_clients.clear()
         for c in clients:
             try:
                 c.close()
@@ -284,10 +292,12 @@ class LyricIpcClient:
         on_message: Callable[[dict[str, Any]], None],
         on_connection_change: Callable[[bool], None] | None = None,
         sock_path: str | None = None,
+        want_peaks: bool = False,
     ) -> None:
         self.sock_path = sock_path or get_lyric_sock_path()
         self._on_message = on_message
         self._on_connection_change = on_connection_change
+        self._want_peaks = bool(want_peaks)
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
         self._closed = False
@@ -328,6 +338,11 @@ class LyricIpcClient:
                 sock.settimeout(1.5)
                 sock.connect(self.sock_path)
                 sock.settimeout(1.0)
+                hello_raw = (
+                    json.dumps({"type": "hello", "want_peaks": self._want_peaks}, separators=(",", ":"))
+                    + "\n"
+                ).encode("utf-8")
+                sock.sendall(hello_raw)
                 with self._lock:
                     self._sock = sock
                 backoff = 0.25

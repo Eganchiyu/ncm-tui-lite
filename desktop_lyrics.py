@@ -491,6 +491,8 @@ def _run_gui(
                     self._persist_settings()
                     Gtk.main_quit()
                     return False
+            else:
+                return False
             self._da.queue_draw()
             self._ensure_tick_active()
             return False

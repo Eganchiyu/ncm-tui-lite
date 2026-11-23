@@ -271,6 +271,7 @@ def _run_gui(
             self._ipc = LyricIpcClient(
                 on_message=lambda m: GLib.idle_add(self._handle_ipc, m),
                 sock_path=sock_path or get_lyric_sock_path(),
+                want_peaks=True,
             )
             self._ipc.start()
 
