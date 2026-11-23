@@ -22,7 +22,11 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Footer, Input, Label, ListItem, ListView, Static
 
 import ncm
-from player import MpvPlayer
+from desktop_lyrics import launch_desktop_lyrics
+from lyric_ipc import LyricIpcServer
+from screen_shader import launch_screen_shader
+from shader_overlay.dsp import LowEndFilterBank
+from player import MpvPlayer, PlayerState
 
 # ── 柔和粉彩调色板（Sakura Twilight Pastel） ─────────────────────────────────
 PASTEL_RING: tuple[tuple[int, int, int], ...] = (
@@ -74,8 +78,12 @@ for _b in range(NUM_BANDS):
     _BAND_RANGES.append((_i0, _i1, _tilt))
 
 
-def _compute_fft_bands(samples: list[float]) -> tuple[float, ...]:
-    """256 点基-2 FFT 并映射为 24 个对数分频感知能量（0.0..1.0）。"""
+_CLICK_BIN_LO = max(1, int(round(1600.0 * FFT_N / PEAK_SR)))
+_CLICK_BIN_HI = min(FFT_N // 2, int(round(4500.0 * FFT_N / PEAK_SR)) + 1)
+
+
+def _compute_fft_bands_and_click(samples: list[float]) -> tuple[tuple[float, ...], float]:
+    """256 点基-2 FFT：返回 (24 对数频段感知能量 0..1, 1.6~4.5kHz 未削顶线性敲击能量)。"""
     a = [samples[_FFT_REV[i]] * _FFT_WIN[_FFT_REV[i]] for i in range(FFT_N)]
     for size, half, wtab in _FFT_TWIDDLES:
         for start in range(0, FFT_N, size):
@@ -90,7 +98,12 @@ def _compute_fft_bands(samples: list[float]) -> tuple[float, ...]:
     for i0, i1, tilt in _BAND_RANGES:
         pk = max(mags[i0:i1]) * inv_n * tilt
         out.append(min(1.0, math.log1p(pk * 5.2) / 2.25))
-    return tuple(out)
+    click_slice = mags[_CLICK_BIN_LO:_CLICK_BIN_HI]
+    if click_slice:
+        click_lin = math.sqrt(sum(m * m for m in click_slice) / len(click_slice)) * inv_n
+    else:
+        click_lin = 0.0
+    return tuple(out), click_lin
 
 
 def _clamp_u8(v: float) -> int:
@@ -118,15 +131,28 @@ def sample_pastel(phase: float) -> tuple[int, int, int]:
     return _lerp_rgb(PASTEL_RING[idx], PASTEL_RING[nxt], pos - int(pos))
 
 
+_PASTEL_LUT: dict[tuple[int, int], str] = {}
+
+
 def pastel_hex(phase: float, brightness: float = 1.0) -> str:
-    r, g, b = sample_pastel(phase)
-    if brightness != 1.0:
+    """基于 256×40 量化查找表的零分配粉彩取色（消除每帧数百次 cos 与字符串格式化）。"""
+    p_bin = int((phase % 1.0) * 256.0) & 255
+    b_bin = max(0, min(50, int(round(brightness * 40.0))))
+    key = (p_bin, b_bin)
+    cached = _PASTEL_LUT.get(key)
+    if cached is not None:
+        return cached
+
+    r, g, b = sample_pastel(p_bin / 256.0)
+    if b_bin != 40:
         base = (23, 26, 41)
-        f = max(0.0, min(1.25, brightness))
+        f = b_bin / 40.0
         r = _clamp_u8(base[0] + (r - base[0]) * f)
         g = _clamp_u8(base[1] + (g - base[1]) * f)
         b = _clamp_u8(base[2] + (b - base[2]) * f)
-    return f"#{r:02x}{g:02x}{b:02x}"
+    res = f"#{r:02x}{g:02x}{b:02x}"
+    _PASTEL_LUT[key] = res
+    return res
 
 
 def gradient_text(
@@ -166,15 +192,27 @@ class PeakTimeline:
         self._lock = threading.Lock()
         # 每帧: (peak, rms, bands_24)
         self.frames: list[tuple[float, float, tuple[float, ...]]] = []
+        # 与 frames 等长的未削顶低频与瞬态线性特征: (sub_rms, body_rms, body_peak, click_lin)
+        self.low_end: list[tuple[float, float, float, float]] = []
         self.done: bool = False
 
+    def computed_seconds(self) -> float:
+        with self._lock:
+            return len(self.frames) / PEAK_FPS
+
     def append_batch(
-        self, batch: list[tuple[float, float, tuple[float, ...]]]
+        self,
+        batch: list[tuple[float, float, tuple[float, ...]]],
+        low_end_batch: list[tuple[float, float, float, float]] | None = None,
     ) -> None:
         if not batch:
             return
         with self._lock:
             self.frames.extend(batch)
+            if low_end_batch is not None:
+                self.low_end.extend(low_end_batch)
+            else:
+                self.low_end.extend([(0.0, 0.0, 0.0, 0.0)] * len(batch))
 
     def mark_done(self) -> None:
         with self._lock:
@@ -221,7 +259,10 @@ class PeakTimeline:
 
 
 class PeakPrecomputer:
-    """后台使用 ffmpeg 极速预计算当前歌曲的 25Hz 波形 Peak 与 24 频段 FFT 频谱。"""
+    """后台使用 ffmpeg 渐进式节流预计算当前歌曲的 25Hz 波形 Peak 与 24 频段 FFT 频谱。"""
+
+    LOOKAHEAD_HIGH_SEC = 18.0
+    LOOKAHEAD_LOW_SEC = 13.0
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -229,12 +270,19 @@ class PeakPrecomputer:
         self._stop_flag = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def start(self, url: str, timeline: PeakTimeline) -> None:
+    def start(
+        self,
+        url: str,
+        timeline: PeakTimeline,
+        get_play_pos: Any = None,
+    ) -> None:
         self.cancel()
         self._stop_flag = threading.Event()
         ev = self._stop_flag
         self._thread = threading.Thread(
-            target=self._worker, args=(url, timeline, ev), daemon=True
+            target=self._worker,
+            args=(url, timeline, ev, get_play_pos),
+            daemon=True,
         )
         self._thread.start()
 
@@ -253,34 +301,51 @@ class PeakPrecomputer:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def _worker(self, url: str, timeline: PeakTimeline, stop_ev: threading.Event) -> None:
+    def _worker(
+        self,
+        url: str,
+        timeline: PeakTimeline,
+        stop_ev: threading.Event,
+        get_play_pos: Any = None,
+    ) -> None:
         cmd = [
             "ffmpeg",
             "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
-            "-user_agent",
-            ncm.UA_WEB,
-            "-headers",
-            f"Referer: {ncm.REFERER}\r\n",
-            "-reconnect",
+            "-threads",
             "1",
-            "-reconnect_streamed",
-            "1",
-            "-reconnect_delay_max",
-            "2",
-            "-i",
-            url,
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            str(PEAK_SR),
-            "-f",
-            "s16le",
-            "pipe:1",
         ]
+        if url.startswith(("http://", "https://")) and not url.startswith("http://127.0.0.1:"):
+            cmd.extend(
+                [
+                    "-user_agent",
+                    ncm.UA_WEB,
+                    "-headers",
+                    f"Referer: {ncm.REFERER}\r\n",
+                    "-reconnect",
+                    "1",
+                    "-reconnect_streamed",
+                    "1",
+                    "-reconnect_delay_max",
+                    "2",
+                ]
+            )
+        cmd.extend(
+            [
+                "-i",
+                url,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                str(PEAK_SR),
+                "-f",
+                "s16le",
+                "pipe:1",
+            ]
+        )
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -298,13 +363,34 @@ class PeakPrecomputer:
             self._proc = proc
 
         frame_bytes = PEAK_HOP * 2  # 480 samples * 2 bytes = 960 bytes/frame
-        read_chunk = frame_bytes * 5  # 每 200ms 音频刷新一次
+        read_chunk = frame_bytes * 10  # 每 400ms 音频块批量处理一次
         leftover = b""
         win_offset = (PEAK_HOP - FFT_N) // 2
+        low_filter = LowEndFilterBank(PEAK_SR, decimate=4)
 
         try:
             assert proc.stdout is not None
             while not stop_ev.is_set():
+                # 渐进式前瞻节流：始终保持领先当前播放进度 ~18 秒，避免切歌瞬间 100% CPU 满载狂算整首歌
+                if get_play_pos is not None:
+                    comp_sec = timeline.computed_seconds()
+                    try:
+                        cur_pos = float(get_play_pos())
+                    except Exception:  # noqa: BLE001
+                        cur_pos = 0.0
+                    if comp_sec > cur_pos + self.LOOKAHEAD_HIGH_SEC:
+                        while not stop_ev.is_set():
+                            if stop_ev.wait(timeout=0.25):
+                                break
+                            try:
+                                cur_pos = float(get_play_pos())
+                            except Exception:  # noqa: BLE001
+                                break
+                            if timeline.computed_seconds() <= cur_pos + self.LOOKAHEAD_LOW_SEC:
+                                break
+                        if stop_ev.is_set():
+                            break
+
                 chunk = proc.stdout.read(read_chunk)
                 if not chunk:
                     break
@@ -320,24 +406,30 @@ class PeakPrecomputer:
                     pcm.byteswap()
 
                 batch: list[tuple[float, float, tuple[float, ...]]] = []
+                low_end_batch: list[tuple[float, float, float, float]] = []
                 inv = 1.0 / PEAK_HOP
+                inv_scale = 1.0 / 32768.0
                 for start in range(0, len(pcm), PEAK_HOP):
-                    mx = 0.0
+                    mx = 0
                     s_sq = 0.0
-                    for i in range(start, start + PEAK_HOP):
-                        x = pcm[i] / 32768.0
-                        ax = x if x >= 0.0 else -x
-                        if ax > mx:
-                            mx = ax
+                    hop_floats = [0.0] * PEAK_HOP
+                    for j in range(PEAK_HOP):
+                        raw_s = pcm[start + j]
+                        ar = raw_s if raw_s >= 0 else -raw_s
+                        if ar > mx:
+                            mx = ar
+                        x = raw_s * inv_scale
+                        hop_floats[j] = x
                         s_sq += x * x
-                    peak = min(1.0, mx ** 0.72)
+                    peak = min(1.0, (mx * inv_scale) ** 0.72)
                     rms = min(1.0, (math.sqrt(s_sq * inv) ** 0.72) * 1.45)
 
-                    fft_start = start + win_offset
-                    fft_slice = [pcm[i] / 32768.0 for i in range(fft_start, fft_start + FFT_N)]
-                    bands = _compute_fft_bands(fft_slice)
+                    sub_rms, body_rms, body_peak, _sub_pk = low_filter.process_block(hop_floats)
+                    fft_slice = hop_floats[win_offset : win_offset + FFT_N]
+                    bands, click_lin = _compute_fft_bands_and_click(fft_slice)
                     batch.append((peak, rms, bands))
-                timeline.append_batch(batch)
+                    low_end_batch.append((sub_rms, body_rms, body_peak, click_lin))
+                timeline.append_batch(batch, low_end_batch)
         except Exception:  # noqa: BLE001
             pass
         finally:
@@ -388,7 +480,7 @@ class AmbientBrand(Static):
             else:
                 twinkle = 0.45 + 0.45 * math.sin(t * 1.2 + i * 0.65)
                 out.append(ch, style=pastel_hex(phase + 0.35 + i * 0.04, brightness=twinkle))
-        self.update(out)
+        self.update(out, layout=False)
 
 
 class VinylCoverStage(Static):
@@ -465,7 +557,7 @@ class VinylCoverStage(Static):
                 brightness=0.72 + 0.22 * math.sin(t * 0.9),
             )
         )
-        self.update(out)
+        self.update(out, layout=False)
 
 
 class AmbientWaveVisualizer(Static):
@@ -615,7 +707,7 @@ class AmbientWaveVisualizer(Static):
             if row < self._VIZ_ROWS - 1:
                 out.append("\n")
 
-        self.update(out)
+        self.update(out, layout=False)
 
     def _render_waveform_mode(
         self,
@@ -697,7 +789,7 @@ class AmbientWaveVisualizer(Static):
             if row < self._VIZ_ROWS - 1:
                 out.append("\n")
 
-        self.update(out)
+        self.update(out, layout=False)
 
 
 class PlaylistItem(ListItem):
@@ -785,16 +877,17 @@ class LyricLine(Static):
             if self.trans:
                 t.append("\n")
                 t.append(self.trans, style="#4e5675")
-        self.update(t)
+        self.update(t, layout=False)
 
 
 class SeekBar(Static):
-    """支持柔和粉彩渐变的点击跳转进度条。"""
+    """支持柔和粉彩渐变的点击跳转进度条（带脏检查避免无意义重绘）。"""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__("", markup=False, **kwargs)
         self.duration: float = 0.0
         self.position: float = 0.0
+        self._last_state: tuple[int, int, int, bool] | None = None
 
     def update_progress(
         self, position: float, duration: float, anim_t: float = 0.0, playing: bool = False
@@ -806,6 +899,13 @@ class SeekBar(Static):
         filled = int(round(width * ratio))
         filled = max(0, min(width - 1, filled)) if width > 1 else 0
 
+        # 将动画相位量化到 ~5Hz，若格数与相位桶均未变化则跳过 Rich Text 重建与 DOM 刷新
+        phase_tick = int(anim_t * 3.0) if playing else 0
+        state_key = (width, filled, phase_tick, playing)
+        if state_key == self._last_state:
+            return
+        self._last_state = state_key
+
         phase = anim_t * 0.04
         out = Text(no_wrap=True)
 
@@ -815,7 +915,7 @@ class SeekBar(Static):
 
         if width > 2:
             if playing:
-                pulse_char = "◉" if int(anim_t * 1.5) % 2 == 0 else "◈"
+                pulse_char = "◉" if (phase_tick % 2 == 0) else "◈"
                 knob_color = pastel_hex(phase + ratio * 0.6, brightness=1.15)
             else:
                 pulse_char = "◎"
@@ -828,7 +928,7 @@ class SeekBar(Static):
         if rest > 0:
             out.append("─" * rest, style="#323854")
 
-        self.update(out)
+        self.update(out, layout=False)
 
     def on_click(self, event: events.Click) -> None:
         if self.duration <= 0 or self.size.width <= 0:
@@ -1105,6 +1205,10 @@ class NcmTuiApp(App):
         Binding("2", "toggle_cover", "封面"),
         Binding("3", "toggle_visualizer", "可视化"),
         Binding("0", "reset_layout", "还原面板"),
+        Binding("l", "toggle_desktop_lyrics", "桌面歌词"),
+        Binding("L", "toggle_desktop_lyrics_lock", "歌词穿透", show=False),
+        Binding("V", "toggle_screen_shader", "流质视效"),
+        Binding("K", "toggle_shader_big_lyrics", "流质大歌词"),
         Binding("slash", "focus_filter", "搜索"),
         Binding("escape", "clear_filter", "清除搜索", show=False),
         Binding("minus", "vol_down", "音量-", key_display="-"),
@@ -1140,17 +1244,27 @@ class NcmTuiApp(App):
         self.show_visualizer: bool = True
 
         self._load_seq: int = 0
+        self._prefetched_seq: int = -1
         self._consecutive_failures: int = 0
         self._cover_cache: dict[str, str] = {}
         self._cover_status: str = "idle"
         self._peak_cache: dict[int, PeakTimeline] = {}
         self._current_peaks: PeakTimeline | None = None
+        self._peaks_sent_tid: int = 0
+        self._peaks_sent_idx: int = 0
         self._peak_worker = PeakPrecomputer()
         self._player: MpvPlayer | None = None
+        self._lyric_ipc: LyricIpcServer | None = None
+        self._lyric_proc: subprocess.Popen | None = None
+        self._shader_proc: subprocess.Popen | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tick_timer = None
         self._tick_count: int = 0
         self._anim_origin: float = time.monotonic()
+        self._last_time_cur: str = ""
+        self._last_time_dur: str = ""
+        self._last_btn_label: str = ""
+        self._last_playing_item: TrackItem | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top-bar"):
@@ -1194,7 +1308,15 @@ class NcmTuiApp(App):
 
     async def on_mount(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._player = MpvPlayer(on_track_end=self._on_mpv_track_end)
+        self._lyric_ipc = LyricIpcServer(on_command=self._on_lyric_ipc_cmd)
+        try:
+            self._lyric_ipc.start()
+        except OSError:
+            self._lyric_ipc = None
+        self._player = MpvPlayer(
+            on_track_end=self._on_mpv_track_end,
+            on_state_change=self._on_mpv_state_change,
+        )
         self._tick_timer = self.set_interval(0.05, self._tick_player_ui)
         asyncio.create_task(self._bootstrap())
 
@@ -1203,9 +1325,110 @@ class NcmTuiApp(App):
             self._tick_timer.stop()
             self._tick_timer = None
         self._peak_worker.cancel()
+        self._cleanup_desktop_lyrics()
         if self._player:
             self._player.close()
             self._player = None
+
+    def _cleanup_desktop_lyrics(self) -> None:
+        if self._lyric_ipc and (
+            (self._lyric_proc is not None and self._lyric_proc.poll() is None)
+            or (self._shader_proc is not None and self._shader_proc.poll() is None)
+        ):
+            self._lyric_ipc.send_control("quit")
+        for proc_attr in ("_lyric_proc", "_shader_proc"):
+            proc = getattr(self, proc_attr, None)
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.wait(timeout=0.8)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+            setattr(self, proc_attr, None)
+        if self._lyric_ipc:
+            self._lyric_ipc.close()
+            self._lyric_ipc = None
+
+    def _flush_peaks_ipc(self) -> None:
+        ipc = self._lyric_ipc
+        tl = self._current_peaks
+        tid = self._peaks_sent_tid
+        if ipc is None or tl is None or not tid:
+            return
+        with tl._lock:
+            total = len(tl.frames)
+            if total <= self._peaks_sent_idx:
+                return
+            start_idx = self._peaks_sent_idx
+            slice_frames = tl.frames[start_idx:total]
+            slice_low = tl.low_end[start_idx:total] if len(tl.low_end) >= total else []
+        batch: list[list[float]] = []
+        for idx, (_pk, rms, bands) in enumerate(slice_frames):
+            n_b = len(bands)
+            kick = sum(bands[0:3]) / 3.0 if n_b >= 3 else 0.0
+            punch = sum(bands[3:6]) / 3.0 if n_b >= 6 else 0.0
+            mid = sum(bands[6:14]) / 8.0 if n_b >= 14 else 0.0
+            high = sum(bands[14:24]) / 10.0 if n_b >= 24 else 0.0
+            if n_b >= 24:
+                b8 = [round(sum(bands[i * 3 : (i + 1) * 3]) / 3.0, 3) for i in range(8)]
+            else:
+                b8 = [round(kick, 3), round(punch, 3), round(mid, 3), round(mid, 3), round(high, 3), round(high, 3), round(high, 3), round(high, 3)]
+            if idx < len(slice_low):
+                sub_rms, body_rms, body_peak, click_lin = slice_low[idx]
+            else:
+                sub_rms = body_rms = body_peak = click_lin = 0.0
+            batch.append([
+                round(kick, 3),
+                round(punch, 3),
+                round(mid, 3),
+                round(rms, 3),
+                round(high, 3),
+                *b8,
+                round(sub_rms, 4),
+                round(body_rms, 4),
+                round(body_peak, 4),
+                round(click_lin, 4),
+            ])
+        self._peaks_sent_idx = start_idx + len(batch)
+        ipc.publish_peaks(track_id=tid, fps=PEAK_FPS, start_idx=start_idx, frames=batch)
+
+    def _on_mpv_state_change(self, st: PlayerState) -> None:
+        ipc = self._lyric_ipc
+        if ipc is None:
+            return
+        dur = st.duration
+        tr = self.current_track
+        if dur <= 0 and tr:
+            dur = (tr.get("duration_ms") or 0) / 1000.0
+        ipc.publish_state(
+            playing=st.playing,
+            paused=st.paused,
+            buffering=st.buffering,
+            time_pos=st.time_pos,
+            time_pos_at=st.time_pos_at,
+            duration=dur,
+            speed=st.speed,
+            seq=st.seq,
+        )
+
+    def _on_lyric_ipc_cmd(self, msg: dict[str, Any]) -> None:
+        if msg.get("type") != "cmd":
+            return
+        action = msg.get("action")
+        val = msg.get("value")
+        if self._loop and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._handle_lyric_cmd_on_loop, action, val)
+
+    def _handle_lyric_cmd_on_loop(self, action: str | None, val: Any) -> None:
+        if action == "toggle_pause":
+            self.action_toggle_pause()
+        elif action == "next":
+            asyncio.create_task(self.action_next_track())
+        elif action == "prev":
+            asyncio.create_task(self.action_prev_track())
+        elif action == "seek_relative" and isinstance(val, (int, float)) and self._player:
+            self._player.seek_relative(float(val))
+        elif action == "vol_delta" and isinstance(val, (int, float)) and self._player:
+            self._player.add_volume(float(val))
 
     def _on_mpv_track_end(self, reason: str) -> None:
         if self._loop and not self._loop.is_closed():
@@ -1267,9 +1490,17 @@ class NcmTuiApp(App):
             self.query_one("#track-header", Static).update(f"♫ {header_title} ({len(tracks)}首)")
         lv = self.query_one("#track-list", ListView)
         await lv.clear()
+        self._last_playing_item = None
         playing_id = self.current_track["id"] if self.current_track else None
+        items: list[TrackItem] = []
         for idx, tr in enumerate(tracks):
-            await lv.append(TrackItem(tr, idx, playing=(tr["id"] == playing_id)))
+            is_pl = tr["id"] == playing_id
+            it = TrackItem(tr, idx, playing=is_pl)
+            if is_pl:
+                self._last_playing_item = it
+            items.append(it)
+        if items:
+            await lv.extend(items)
 
     @on(ListView.Selected, "#playlist-list")
     async def on_playlist_selected(self, event: ListView.Selected) -> None:
@@ -1323,16 +1554,41 @@ class NcmTuiApp(App):
         elif bid == "btn-fwd":
             self.action_seek_fwd()
 
+    def _ensure_shuffle_bag(self) -> None:
+        n = len(self.play_queue)
+        if n > 1 and not self.shuffle_bag:
+            self.shuffle_bag = [i for i in range(n) if i != self.current_index]
+            random.shuffle(self.shuffle_bag)
+
+    def _peek_next_index(self) -> int | None:
+        n = len(self.play_queue)
+        if n == 0:
+            return None
+        if n == 1:
+            return 0
+        if self.shuffle_mode:
+            self._ensure_shuffle_bag()
+            return self.shuffle_bag[-1] if self.shuffle_bag else 0
+        return 0 if self.current_index is None else (self.current_index + 1) % n
+
     def _pick_next_shuffle_index(self) -> int | None:
         n = len(self.play_queue)
         if n == 0:
             return None
         if n == 1:
             return 0
-        if not self.shuffle_bag:
-            self.shuffle_bag = [i for i in range(n) if i != self.current_index]
-            random.shuffle(self.shuffle_bag)
+        self._ensure_shuffle_bag()
         return self.shuffle_bag.pop()
+
+    def _get_current_play_pos(self) -> float:
+        p = self._player
+        if p is None:
+            return 0.0
+        st = p.get_state()
+        pos = st.time_pos
+        if st.playing and not st.paused and not st.buffering and st.time_pos_at > 0:
+            pos += max(0.0, min(0.35, time.monotonic() - st.time_pos_at))
+        return pos
 
     async def _play_next(self, auto: bool = False) -> None:
         if not self.play_queue:
@@ -1373,6 +1629,12 @@ class NcmTuiApp(App):
         self.query_one("#now-quality", Static).update(f"◌ 正在解析 {self.level.upper()} 无损直链...")
         self._refresh_playing_marker()
 
+        if self._lyric_ipc:
+            self._lyric_ipc.publish_track(track, has_yrc=False, lines=[])
+
+        # 点歌瞬间并行拉取封面与歌词，无需等待音频直链解析完成
+        asyncio.create_task(self._load_cover_and_lyrics(track, seq))
+
         try:
             info = await asyncio.to_thread(ncm.stream_url, self.cookie, track["id"], self.level)
         except Exception as e:  # noqa: BLE001
@@ -1391,7 +1653,10 @@ class NcmTuiApp(App):
             await self._skip_on_failure(track)
             return
 
-        playable_url = await asyncio.to_thread(ncm.probe_playable_url, raw_url)
+        actual_lv = str(info.get("level") or self.level)
+        playable_url = await asyncio.to_thread(
+            ncm.resolve_cached_stream, int(track["id"]), raw_url, actual_lv
+        )
         if seq != self._load_seq:
             return
 
@@ -1403,7 +1668,7 @@ class NcmTuiApp(App):
 
         self._consecutive_failures = 0
         self._cover_status = "playing"
-        lv = (info.get("level") or self.level).upper()
+        lv = actual_lv.upper()
         fmt = (info.get("type") or "flac").upper()
         br = int((info.get("br") or 0) / 1000)
         size_mb = round((info.get("size") or 0) / 1048576, 1)
@@ -1415,13 +1680,20 @@ class NcmTuiApp(App):
             self._current_peaks = cached_peaks
         else:
             timeline = PeakTimeline()
-            if len(self._peak_cache) >= 12:
+            if len(self._peak_cache) >= 6:
                 self._peak_cache.pop(next(iter(self._peak_cache)))
             self._peak_cache[tid] = timeline
             self._current_peaks = timeline
-            self._peak_worker.start(playable_url, timeline)
-
-        asyncio.create_task(self._load_cover_and_lyrics(track, seq))
+            self._peak_worker.start(
+                playable_url, timeline, get_play_pos=self._get_current_play_pos
+            )
+        self._peaks_sent_tid = tid
+        self._peaks_sent_idx = 0
+        if self._lyric_ipc:
+            self._lyric_ipc.publish_peaks(
+                track_id=tid, fps=PEAK_FPS, start_idx=0, frames=[], reset=True
+            )
+            self._flush_peaks_ipc()
 
     async def _skip_on_failure(self, track: dict[str, Any]) -> None:
         self._consecutive_failures += 1
@@ -1433,20 +1705,30 @@ class NcmTuiApp(App):
         await asyncio.sleep(0.3)
         await self._play_next(auto=True)
 
+    def _compute_cover_dims(self) -> tuple[int, int]:
+        cover_box = self.query_one("#cover-box")
+        right_pane = self.query_one("#right-pane")
+        pane_h = right_pane.size.height or 30
+        max_w = max(16, min(32, (cover_box.size.width or 34) - 4))
+        max_h = max(6, min(10, pane_h // 4))
+        h = max(6, min(max_h, max_w // 2))
+        w = min(max_w, h * 2)
+        return w, h
+
     async def _load_cover_and_lyrics(self, track: dict[str, Any], seq: int) -> None:
         pic_url = track.get("pic_url") or ""
         cover_stage = self.query_one("#cover-art", VinylCoverStage)
-        if pic_url:
+
+        async def _do_cover() -> None:
+            if not pic_url:
+                if seq == self._load_seq:
+                    self._cover_status = "error"
+                    cover_stage.clear_cover(time.monotonic() - self._anim_origin, status="error")
+                return
             if pic_url in self._cover_cache:
                 ansi = self._cover_cache[pic_url]
             else:
-                cover_box = self.query_one("#cover-box")
-                right_pane = self.query_one("#right-pane")
-                pane_h = right_pane.size.height or 30
-                max_w = max(16, min(32, (cover_box.size.width or 34) - 4))
-                max_h = max(6, min(10, pane_h // 4))
-                h = max(6, min(max_h, max_w // 2))
-                w = min(max_w, h * 2)
+                w, h = self._compute_cover_dims()
                 try:
                     ansi = await asyncio.to_thread(ncm.fetch_cover_ansi, pic_url, w, h)
                 except Exception:  # noqa: BLE001
@@ -1462,17 +1744,50 @@ class NcmTuiApp(App):
             else:
                 self._cover_status = "error"
                 cover_stage.clear_cover(time.monotonic() - self._anim_origin, status="error")
-        else:
-            self._cover_status = "error"
-            cover_stage.clear_cover(time.monotonic() - self._anim_origin, status="error")
 
-        try:
-            lyrics = await asyncio.to_thread(ncm.song_lyric, self.cookie, track["id"])
-        except Exception:  # noqa: BLE001
-            lyrics = []
+        async def _do_lyrics() -> None:
+            try:
+                rich_lyric = await asyncio.to_thread(ncm.song_lyric_rich, self.cookie, track["id"])
+            except Exception:  # noqa: BLE001
+                rich_lyric = {"has_yrc": False, "lines": []}
+            if seq != self._load_seq:
+                return
+            rich_lines = rich_lyric.get("lines") or []
+            if self._lyric_ipc:
+                self._lyric_ipc.publish_track(
+                    track,
+                    has_yrc=bool(rich_lyric.get("has_yrc")),
+                    lines=rich_lines,
+                )
+            lyrics = [(float(r["start"]), str(r["orig"]), str(r.get("trans") or "")) for r in rich_lines]
+            await self._render_lyrics(lyrics)
+
+        await asyncio.gather(_do_cover(), _do_lyrics())
+
+    async def _prefetch_next_track(self, next_track: dict[str, Any], seq: int) -> None:
+        """后台静默预取下一首曲目的直链、歌词与封面，使切歌达到 0ms 瞬切。"""
         if seq != self._load_seq:
             return
-        await self._render_lyrics(lyrics)
+        tid = int(next_track["id"])
+        pic_url = next_track.get("pic_url") or ""
+        w, h = self._compute_cover_dims()
+
+        def _bg_prefetch() -> None:
+            try:
+                ncm.stream_url(self.cookie, tid, self.level)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                ncm.song_lyric_rich(self.cookie, tid)
+            except Exception:  # noqa: BLE001
+                pass
+            if pic_url:
+                try:
+                    ncm.fetch_cover_ansi(pic_url, w, h)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        await asyncio.to_thread(_bg_prefetch)
 
     async def _render_lyrics(self, lyrics: list[tuple[float, str, str]]) -> None:
         self.lyrics = lyrics
@@ -1492,11 +1807,25 @@ class NcmTuiApp(App):
             self.seek_to(event.widget.sec)
 
     def _refresh_playing_marker(self) -> None:
-        lv = self.query_one("#track-list", ListView)
         playing_id = self.current_track["id"] if self.current_track else None
+        if self._last_playing_item is not None:
+            try:
+                if self._last_playing_item.track["id"] != playing_id:
+                    self._last_playing_item.set_playing(False)
+                    self._last_playing_item = None
+                else:
+                    return
+            except Exception:  # noqa: BLE001
+                self._last_playing_item = None
+
+        if playing_id is None:
+            return
+        lv = self.query_one("#track-list", ListView)
         for item in lv.children:
-            if isinstance(item, TrackItem):
-                item.set_playing(item.track["id"] == playing_id)
+            if isinstance(item, TrackItem) and item.track["id"] == playing_id:
+                item.set_playing(True)
+                self._last_playing_item = item
+                break
 
     def _render_cover_aura(self, t: float, playing: bool, paused: bool) -> Text:
         phase = t * 0.045
@@ -1553,8 +1882,22 @@ class NcmTuiApp(App):
             if dur > 0:
                 pos = min(dur, pos)
 
-        # 20 FPS 实时刷新真 FFT 频谱 / 对称波形 与 进度条
-        if self.show_visualizer:
+        # 播放过 18 秒或剩余不足 25 秒时，后台静默预取下一首曲目
+        if (
+            is_actively_playing
+            and self._prefetched_seq != self._load_seq
+            and (pos >= 18.0 or (dur > 5.0 and (dur - pos) <= 25.0))
+        ):
+            self._prefetched_seq = self._load_seq
+            nxt_idx = self._peek_next_index()
+            if nxt_idx is not None and 0 <= nxt_idx < len(self.play_queue):
+                asyncio.create_task(
+                    self._prefetch_next_track(self.play_queue[nxt_idx], self._load_seq)
+                )
+
+        # 待机/暂停自动降频：活跃播放时 20 FPS 刷频谱，暂停/待机时降至 2.5 FPS 省电降温
+        should_draw_viz = is_actively_playing or st.buffering or (self._tick_count % 8 == 0)
+        if self.show_visualizer and should_draw_viz:
             wave_state = (
                 "buffering"
                 if st.buffering
@@ -1562,12 +1905,24 @@ class NcmTuiApp(App):
             )
             wave_viz.render_wave(t, state=wave_state, pos=pos, timeline=self._current_peaks)
 
-        seek_bar.update_progress(pos, dur, anim_t=t, playing=is_actively_playing)
-        time_cur.update(fmt_time(pos))
-        time_dur.update(fmt_time(dur))
+        if self._lyric_ipc and self._current_peaks is not None:
+            self._flush_peaks_ipc()
 
-        # 慢动画与状态装饰 (~6.7 FPS)
-        if self._tick_count % 3 == 0:
+        seek_bar.update_progress(pos, dur, anim_t=t, playing=is_actively_playing)
+
+        cur_str = fmt_time(pos)
+        if cur_str != self._last_time_cur:
+            self._last_time_cur = cur_str
+            time_cur.update(cur_str, layout=False)
+
+        dur_str = fmt_time(dur)
+        if dur_str != self._last_time_dur:
+            self._last_time_dur = dur_str
+            time_dur.update(dur_str, layout=False)
+
+        # 慢动画与状态装饰（活跃播放 ~5 FPS，待机/暂停 ~1.6 FPS）
+        ambient_div = 4 if (is_actively_playing or st.buffering) else 12
+        if self._tick_count % ambient_div == 0:
             brand.render_frame(t, playing=is_actively_playing)
             if self.show_cover:
                 if not cover_stage.has_cover:
@@ -1581,9 +1936,15 @@ class NcmTuiApp(App):
                         )
                     )
                     cover_stage.render_ascii_frame(t, status=ascii_state)
-                cover_aura.update(self._render_cover_aura(t, playing=st.playing, paused=st.paused))
+                cover_aura.update(
+                    self._render_cover_aura(t, playing=st.playing, paused=st.paused),
+                    layout=False,
+                )
 
-            play_btn.label = "▶" if (st.paused or not st.playing) else "⏸"
+            target_btn_lbl = "▶" if (st.paused or not st.playing) else "⏸"
+            if target_btn_lbl != self._last_btn_label:
+                self._last_btn_label = target_btn_lbl
+                play_btn.label = target_btn_lbl
 
             eq_frames = ("▁▂▄▃", "▂▄▆▄", "▃▆▄▂", "▄▃▂▄")
             spin_frames = ("◐", "◓", "◑", "◒")
@@ -1604,7 +1965,7 @@ class NcmTuiApp(App):
                     status_text.append(f"播放中·{mode_tag}", style=FG_MINT)
             else:
                 status_text.append("✧ 待机", style=FG_MUTED)
-            status_lbl.update(status_text)
+            status_lbl.update(status_text, layout=False)
 
         # 歌词丝滑滚动 + 景深渐变高亮
         if self.lyric_times and st.playing:
@@ -1676,6 +2037,56 @@ class NcmTuiApp(App):
         self.show_cover = True
         self.show_visualizer = True
         self._apply_panel_visibility()
+
+    def action_toggle_desktop_lyrics(self) -> None:
+        if self._lyric_ipc and self._lyric_ipc.has_clients():
+            self._lyric_ipc.send_control("toggle_visible")
+            return
+        if self._lyric_proc is not None and self._lyric_proc.poll() is None:
+            if self._lyric_ipc:
+                self._lyric_ipc.send_control("toggle_visible")
+            return
+        try:
+            proc = launch_desktop_lyrics(foreground=False)
+            if isinstance(proc, subprocess.Popen):
+                self._lyric_proc = proc
+            self.notify("已开启 512×64 桌面歌词（左键拖动 / 滚轮调偏移 / Shift+L 穿透）")
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"启动桌面歌词失败: {e}", severity="error")
+
+    def action_toggle_desktop_lyrics_lock(self) -> None:
+        if self._lyric_ipc and self._lyric_ipc.has_clients():
+            self._lyric_ipc.send_control("toggle_lock")
+            self.notify("已切换桌面歌词鼠标穿透状态")
+        else:
+            self.notify("桌面歌词未连接，按 l 启动", severity="warning")
+
+    def action_toggle_screen_shader(self) -> None:
+        if self._shader_proc is not None and self._shader_proc.poll() is None:
+            if self._lyric_ipc:
+                self._lyric_ipc.send_control("toggle_shader")
+            return
+        try:
+            proc = launch_screen_shader(active=True, foreground=False)
+            if isinstance(proc, subprocess.Popen):
+                self._shader_proc = proc
+            self.notify("已启动全屏流质 Shader 视效（Shift+V / Ctrl+Alt+V 切换，Shift+K / Ctrl+Alt+L 开关大歌词）")
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"启动流质视效失败: {e}", severity="error")
+
+    def action_toggle_shader_big_lyrics(self) -> None:
+        if self._shader_proc is not None and self._shader_proc.poll() is None:
+            if self._lyric_ipc:
+                self._lyric_ipc.send_control("toggle_big_lyrics")
+                self.notify("已切换流质大歌词显示（Shift+K / Ctrl+Alt+L）")
+            return
+        try:
+            proc = launch_screen_shader(active=True, big_lyrics=True, foreground=False)
+            if isinstance(proc, subprocess.Popen):
+                self._shader_proc = proc
+            self.notify("已启动全屏流质视效并开启大歌词（Shift+K / Ctrl+Alt+L 随时开关）")
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"启动流质大歌词失败: {e}", severity="error")
 
     # ── 播放控制快捷键 ───────────────────────────────────────────────────────
     def seek_to(self, seconds: float) -> None:
@@ -1763,6 +2174,7 @@ class NcmTuiApp(App):
             self._tick_timer.stop()
             self._tick_timer = None
         self._peak_worker.cancel()
+        self._cleanup_desktop_lyrics()
         if self._player:
             self._player.close()
             self._player = None

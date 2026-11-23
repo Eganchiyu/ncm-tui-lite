@@ -12,7 +12,8 @@
   - 歌单浏览、关键词即时过滤、随机洗牌（带历史回退栈）与顺序循环；
   - `chafa` 真彩终端专辑封面渲染（缺失时自动回退为内置 ASCII 黑胶动画）；
   - 双语滚动歌词（支持鼠标点击歌词行或进度条跳转）；
-  - 基于 `ffmpeg` 流式预计算的 24 频段 FFT 频谱柱状图（含峰值帽）与实时对称波形图。
+  - 基于 `ffmpeg` 流式预计算的 24 频段 FFT 频谱柱状图（含峰值帽）与实时对称波形图；
+  - **常驻顶层桌面歌词窗口**（`512×64` 胶囊浮窗，GTK3 + Cairo VSync 高刷、单调锁相 PLL 毫秒同步、支持 YRC 逐字卡拉OK扫光与鼠标点击穿透）。
 
 ---
 
@@ -87,6 +88,10 @@ python ncm.py tui
 # 如需指定最高音质档位（lossless / exhigh / higher / standard）
 python ncm.py tui --level exhigh
 
+# 3b) 单独启动常驻顶层桌面歌词窗口（也可在 TUI 内按 l 一键开关）
+python ncm.py lyrics
+python ncm.py lyrics --width 512 --height 64 --offset-ms 0
+
 # 4) 按歌曲 ID 下载单曲到 output/（ID 即网页版 song?id=xxxxx 中的数字）
 python ncm.py dl 1385116338
 python ncm.py dl 1385116338 --level exhigh
@@ -108,6 +113,7 @@ python ncm.py url 1385116338
 - `v`：切换可视化模式（24 频段 FFT 频谱 ↔ 实时对称波形）
 - `1` / `2` / `3`：分别显示/隐藏 歌单栏 / 专辑封面 / 音频可视化
 - `0`：还原全部面板显示
+- `l` / `Shift+L`：开启或显示/隐藏 512×64 桌面歌词浮窗 / 切换鼠标穿透锁定
 - `/` / `Esc`：聚焦搜索过滤当前歌单 / 清除搜索条件
 - `-` / `=`（或 `+`）：音量 -5% / +5%
 - 鼠标点击进度条或任意歌词行：直接跳转到对应时间点
@@ -144,6 +150,8 @@ python ncm.py url 1385116338
 | `ncm.py` | 网易云登录、歌单/详情/歌词/直链接口与 CLI 入口 |
 | `player.py` | 基于 `mpv --input-ipc-server` 的流媒体音频控制器 |
 | `tui.py` | Textual TUI 播放器（封面、FFT 频谱/波形、滚动双语歌词与控制栏） |
+| `lyric_ipc.py` | 播放器与桌面歌词之间的低延迟 Unix Socket 双向同步模块 |
+| `desktop_lyrics.py` | 常驻顶层桌面歌词浮窗（GTK3 + Cairo VSync 高刷、PLL 同步与逐字扫光） |
 | `cookie.txt` | 运行 `login` 后在本地生成（已在 `.gitignore` 中排除，切勿提交或外传） |
 | `output/` | 运行后在本地生成，存放下载音频与登录二维码临时图片（已在 `.gitignore` 中排除） |
 | `.venv/` | 建议创建的 Python 虚拟环境目录（已在 `.gitignore` 中排除） |

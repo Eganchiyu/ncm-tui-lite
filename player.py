@@ -23,15 +23,19 @@ class PlayerState:
     time_pos_at: float = 0.0
     duration: float = 0.0
     volume: float = 100.0
+    speed: float = 1.0
+    seq: int = 0
 
 
 class MpvPlayer:
     def __init__(
         self,
         on_track_end: Callable[[str], None] | None = None,
+        on_state_change: Callable[[PlayerState], None] | None = None,
         extra_args: list[str] | None = None,
     ) -> None:
         self._on_track_end = on_track_end
+        self._on_state_change = on_state_change
         self._sock_path = os.path.join(tempfile.gettempdir(), f"ncm_mpv_{os.getpid()}_{id(self)}.sock")
         if os.path.exists(self._sock_path):
             os.unlink(self._sock_path)
@@ -92,8 +96,33 @@ class MpvPlayer:
             (4, "paused-for-cache"),
             (5, "volume"),
             (6, "idle-active"),
+            (7, "speed"),
         ):
             self._command(["observe_property", oid, prop])
+
+    def set_state_listener(self, cb: Callable[[PlayerState], None] | None) -> None:
+        self._on_state_change = cb
+
+    def _emit_state(self, state: PlayerState) -> None:
+        cb = self._on_state_change
+        if cb is not None:
+            try:
+                cb(state)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _snapshot_locked(self) -> PlayerState:
+        return PlayerState(
+            playing=self._state.playing,
+            paused=self._state.paused,
+            buffering=self._state.buffering,
+            time_pos=self._state.time_pos,
+            time_pos_at=self._state.time_pos_at,
+            duration=self._state.duration,
+            volume=self._state.volume,
+            speed=self._state.speed,
+            seq=self._state.seq,
+        )
 
     def _read_loop(self) -> None:
         try:
@@ -119,25 +148,48 @@ class MpvPlayer:
                     continue
 
                 event = msg.get("event")
+                snap: PlayerState | None = None
                 if event == "property-change":
                     name = msg.get("name")
                     val = msg.get("data")
+                    now = time.monotonic()
                     with self._lock:
+                        changed = False
                         if name == "time-pos" and isinstance(val, (int, float)):
                             self._state.time_pos = max(0.0, float(val))
-                            self._state.time_pos_at = time.monotonic()
+                            self._state.time_pos_at = now
+                            changed = True
                         elif name == "duration" and isinstance(val, (int, float)):
                             self._state.duration = max(0.0, float(val))
+                            changed = True
                         elif name == "pause" and isinstance(val, bool):
                             self._state.paused = val
-                            self._state.time_pos_at = time.monotonic()
+                            self._state.time_pos_at = now
+                            changed = True
                         elif name == "paused-for-cache" and isinstance(val, bool):
                             self._state.buffering = val
-                            self._state.time_pos_at = time.monotonic()
+                            self._state.time_pos_at = now
+                            changed = True
                         elif name == "volume" and isinstance(val, (int, float)):
                             self._state.volume = float(val)
                         elif name == "idle-active" and isinstance(val, bool):
                             self._state.playing = not val
+                            self._state.seq += 1
+                            changed = True
+                        elif name == "speed" and isinstance(val, (int, float)):
+                            self._state.speed = max(0.1, float(val))
+                            self._state.time_pos_at = now
+                            changed = True
+                        if changed:
+                            snap = self._snapshot_locked()
+                    if snap is not None:
+                        self._emit_state(snap)
+                elif event == "seek":
+                    with self._lock:
+                        self._state.seq += 1
+                        self._state.time_pos_at = time.monotonic()
+                        snap = self._snapshot_locked()
+                    self._emit_state(snap)
                 elif event == "end-file":
                     reason = msg.get("reason", "")
                     eid = msg.get("playlist_entry_id")
@@ -146,6 +198,10 @@ class MpvPlayer:
                         if reason in ("eof", "error"):
                             self._state.playing = False
                             self._state.buffering = False
+                            self._state.seq += 1
+                            snap = self._snapshot_locked()
+                    if snap is not None:
+                        self._emit_state(snap)
                     if is_current and reason in ("eof", "error") and self._on_track_end:
                         try:
                             self._on_track_end(reason)
@@ -181,6 +237,7 @@ class MpvPlayer:
             self._state.duration = 0.0
             self._state.buffering = True
             self._state.paused = False
+            self._state.seq += 1
         self._command(["set_property", "pause", False])
         resp = self._command(["loadfile", url, "replace"], timeout=5.0)
         if resp.get("error") == "success":
@@ -188,6 +245,8 @@ class MpvPlayer:
             with self._lock:
                 self._current_entry_id = eid
                 self._state.playing = True
+                snap = self._snapshot_locked()
+            self._emit_state(snap)
             return True
         return False
 
@@ -222,18 +281,14 @@ class MpvPlayer:
             self._state.playing = False
             self._state.buffering = False
             self._state.time_pos = 0.0
+            self._state.time_pos_at = time.monotonic()
+            self._state.seq += 1
+            snap = self._snapshot_locked()
+        self._emit_state(snap)
 
     def get_state(self) -> PlayerState:
         with self._lock:
-            return PlayerState(
-                playing=self._state.playing,
-                paused=self._state.paused,
-                buffering=self._state.buffering,
-                time_pos=self._state.time_pos,
-                time_pos_at=self._state.time_pos_at,
-                duration=self._state.duration,
-                volume=self._state.volume,
-            )
+            return self._snapshot_locked()
 
     def close(self) -> None:
         if self._closed:
